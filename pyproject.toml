@@ -51,6 +51,10 @@ opencl = [
     'pyopencl', # For silx.opencl
     'Mako',     # For pyopencl reduction
 ]
+pygfx = [
+    'pygfx >=0.16.0,<0.17.0',  # For silx.gui.plot pygfx backend
+    'rendercanvas >=2.6.1',     # Qt integration for pygfx
+]
 full = [
     'silx[opencl]',
     'qtconsole',             # For silx.gui.console
