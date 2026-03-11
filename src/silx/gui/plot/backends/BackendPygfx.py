@@ -601,6 +601,8 @@ class _PygfxMarkerItem(dict):
         })
 
         self.group = gfx.Group()
+        self._lineObj = None
+        self._textObj = None
         rgba = colors.rgba(color)
         gfxColor = gfx.Color(*rgba)
 
@@ -619,9 +621,6 @@ class _PygfxMarkerItem(dict):
             self._pointsObj = gfx.Points(geom, mat)
             self.group.add(self._pointsObj)
 
-        # Text label will be rendered in screen-space overlay
-        # (handled during draw, not here)
-
 
 # BackendPygfx ################################################################
 
@@ -635,8 +634,16 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
     _TEXT_MARKER_PADDING = 4
 
     def __init__(self, plot, parent=None):
-        QRenderWidget.__init__(self, parent=parent)
+        QRenderWidget.__init__(self, parent=parent, present_method="screen")
         BackendBase.BackendBase.__init__(self, plot, parent)
+
+        # Match OpenGLWidget: a layout is needed for Qt to respect sizeHint
+        layout = qt.QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        self.setLayout(layout)
+
+        # Raise max FPS for responsive interaction (zoom, pan, drag)
+        self.set_update_mode("ondemand", max_fps=240)
 
         self._defaultFont = None
 
@@ -648,7 +655,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         self._mousePosInPixels = None
 
         # pygfx rendering objects
-        self._renderer = gfx.WgpuRenderer(self)
+        self._renderer = gfx.WgpuRenderer(self, pixel_ratio=4)
         self._scene = gfx.Scene()
 
         # Camera: orthographic for 2D plotting
@@ -731,6 +738,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
             self._syncPlotFrame()
             self._syncCamera()
             self._updateFrame()
+            self._updateMarkers()
             self._updateCrosshair()
 
             # First pass: render frame (background + axes) in full widget
@@ -884,6 +892,133 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
             self._screenScene.add(textObj)
 
+    def _updateMarkers(self):
+        """Update marker lines and text labels in screen space."""
+        plot = self._plotRef()
+        if plot is None:
+            return
+
+        trRanges = self._plotFrame.transformedDataRanges
+        pixelOffset = 3
+
+        for plotItem in self.getItemsFromBackToFront(
+            condition=lambda i: i.isVisible()
+        ):
+            if plotItem._backendRenderer is None:
+                continue
+            item = plotItem._backendRenderer
+            if not isinstance(item, _PygfxMarkerItem):
+                continue
+
+            xCoord = item["x"]
+            yCoord = item["y"]
+            yAxis = item.get("yaxis", "left")
+            color = item["color"]
+            bgColor = item.get("bgcolor")
+            linewidth = item["linewidth"]
+            dashPattern = item["dashpattern"]
+
+            # Remove old line and text from the screen scene
+            if item._lineObj is not None:
+                if item._lineObj.parent is not None:
+                    item._lineObj.parent.remove(item._lineObj)
+                item._lineObj = None
+            if item._textObj is not None:
+                if item._textObj.parent is not None:
+                    item._textObj.parent.remove(item._textObj)
+                item._textObj = None
+
+            gfxColor = gfx.Color(*color)
+
+            if xCoord is None or yCoord is None:
+                # hline or vline marker — render in screen space
+                if xCoord is None:
+                    # Horizontal line at y
+                    pixelPos = self._plotFrame.dataToPixel(
+                        0.5 * sum(self._plotFrame.dataRanges[0]),
+                        yCoord, axis=yAxis,
+                    )
+                    if pixelPos is None:
+                        continue
+                    left = self._plotFrame.margins.left
+                    right = self._plotFrame.size[0] - self._plotFrame.margins.right
+                    positions = numpy.array([
+                        [left, pixelPos[1], 0],
+                        [right, pixelPos[1], 0],
+                    ], dtype=numpy.float32)
+
+                    if item["text"] is not None:
+                        tx = right - pixelOffset
+                        ty = pixelPos[1] - pixelOffset
+                        textObj = gfx.Text(
+                            material=gfx.TextMaterial(color=gfxColor),
+                            text=item["text"],
+                            font_size=self._getDefaultFont().pointSizeF() or 10,
+                            anchor="bottom-right",
+                            screen_space=True,
+                        )
+                        textObj.local.position = (tx, ty, 0)
+                        item._textObj = textObj
+                        self._screenScene.add(textObj)
+                else:
+                    # Vertical line at x
+                    yRange = self._plotFrame.dataRanges[1 if yAxis == "left" else 2]
+                    pixelPos = self._plotFrame.dataToPixel(
+                        xCoord, 0.5 * sum(yRange), axis=yAxis,
+                    )
+                    if pixelPos is None:
+                        continue
+                    top = self._plotFrame.margins.top
+                    bottom = self._plotFrame.size[1] - self._plotFrame.margins.bottom
+                    positions = numpy.array([
+                        [pixelPos[0], top, 0],
+                        [pixelPos[0], bottom, 0],
+                    ], dtype=numpy.float32)
+
+                    if item["text"] is not None:
+                        tx = pixelPos[0] + pixelOffset
+                        ty = top + pixelOffset
+                        textObj = gfx.Text(
+                            material=gfx.TextMaterial(color=gfxColor),
+                            text=item["text"],
+                            font_size=self._getDefaultFont().pointSizeF() or 10,
+                            anchor="top-left",
+                            screen_space=True,
+                        )
+                        textObj.local.position = (tx, ty, 0)
+                        item._textObj = textObj
+                        self._screenScene.add(textObj)
+
+                geom = gfx.Geometry(positions=positions)
+                mat = gfx.LineMaterial(
+                    thickness=max(linewidth, 1.0),
+                    color=gfxColor,
+                    dash_pattern=dashPattern if dashPattern else (),
+                )
+                item._lineObj = gfx.Line(geom, mat)
+                self._screenScene.add(item._lineObj)
+
+            else:
+                # Point marker — text label in screen space
+                if item["text"] is not None:
+                    pixelPos = self._plotFrame.dataToPixel(
+                        xCoord, yCoord, axis=yAxis,
+                    )
+                    if pixelPos is None:
+                        continue
+                    tx = pixelPos[0] + pixelOffset
+                    ty = pixelPos[1] + pixelOffset
+                    textObj = gfx.Text(
+                        material=gfx.TextMaterial(color=gfxColor),
+                        text=item["text"],
+                        font_size=self._getDefaultFont().pointSizeF() or 10,
+                        anchor="top-left",
+                        screen_space=True,
+                    )
+                    textObj.local.position = (tx, ty, 0)
+                    item._textObj = textObj
+                    self._screenScene.add(textObj)
+
     def _updateCrosshair(self):
         """Update crosshair cursor lines."""
         # Remove old crosshair
@@ -947,6 +1082,9 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
     def sizeHint(self):
         return qt.QSize(8 * 80, 6 * 80)
 
+    def minimumSizeHint(self):
+        return qt.QSize(0, 0)
+
     def mousePressEvent(self, event):
         if event.button() not in self._MOUSE_BTNS:
             return super().mousePressEvent(event)
@@ -993,11 +1131,15 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        w, h = self.width(), self.height()
+        if w == 0 or h == 0:
+            return
         dpr = self.getDevicePixelRatio()
-        self._plotFrame.size = (
-            int(self.width() * dpr),
-            int(self.height() * dpr),
-        )
+        self._plotFrame.size = (int(w * dpr), int(h * dpr))
+
+        # Re-apply current data ranges to the new size (same as OpenGL backend)
+        (xMin, xMax), (yMin, yMax), (y2Min, y2Max) = self._plotFrame.dataRanges
+        self.setLimits(xMin, xMax, yMin, yMax, y2Min, y2Max)
 
     # Backend API: Log transform helpers #####################################
 
@@ -1121,14 +1263,8 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
     def addShape(
         self, x, y, shape, color, fill, overlay, linestyle, linewidth, gapcolor,
     ):
-        x = numpy.asarray(x, dtype=numpy.float64)
-        y = numpy.asarray(y, dtype=numpy.float64)
-        if not overlay:
-            # Non-overlay shapes have coordinates in original data space;
-            # overlay shapes get coordinates from pixelToData which already
-            # returns values in the camera's (log-transformed) space.
-            x = self._logTransformX(x)
-            y = self._logTransformY(y)
+        x = self._logTransformX(numpy.asarray(x, dtype=numpy.float64))
+        y = self._logTransformY(numpy.asarray(y, dtype=numpy.float64))
         # Ensure overlay outlines (e.g. zoom selection) are clearly visible
         if overlay and linewidth < 2.0:
             linewidth = 2.0
@@ -1172,36 +1308,6 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
             x, y, text, color, symbol, symbolsize, linewidth,
             linestyle, constraint, yaxis, font, bgcolor,
         )
-
-        # Add marker lines for hline/vline markers
-        if x is None or y is None:
-            rgba = colors.rgba(color)
-            gfxColor = gfx.Color(*rgba)
-            dashPattern = _lineStyleToDashPattern(linestyle)
-
-            # These will be updated in _renderMarkerLines during draw
-            # For now, create with placeholder positions
-            if x is None:
-                # Horizontal line at y
-                positions = numpy.array([
-                    [-1e10, y, 0],
-                    [1e10, y, 0],
-                ], dtype=numpy.float32)
-            else:
-                # Vertical line at x
-                positions = numpy.array([
-                    [x, -1e10, 0],
-                    [x, 1e10, 0],
-                ], dtype=numpy.float32)
-
-            geom = gfx.Geometry(positions=positions)
-            mat = gfx.LineMaterial(
-                thickness=max(linewidth, 1.0),
-                color=gfxColor,
-                dash_pattern=dashPattern if dashPattern else (),
-            )
-            lineObj = gfx.Line(geom, mat)
-            item.group.add(lineObj)
 
         self._overlayGroup.add(item.group)
         return item
