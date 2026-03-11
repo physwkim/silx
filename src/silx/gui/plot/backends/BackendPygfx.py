@@ -674,10 +674,14 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
         # Screen-space scene for frame/axes rendering (PR 9)
         self._screenScene = gfx.Scene()
-        self._screenScene.add(
-            gfx.Background(None, gfx.BackgroundMaterial(gfx.Color(1, 1, 1, 1)))
+        self._screenBg = gfx.Background(
+            None, gfx.BackgroundMaterial(gfx.Color(1, 1, 1, 1))
         )
+        self._screenScene.add(self._screenBg)
+        self._screenFrameGroup = gfx.Group()
+        self._screenScene.add(self._screenFrameGroup)
         self._screenCamera = gfx.OrthographicCamera(maintain_aspect=False)
+        self._cachedBgColor = (1.0, 1.0, 1.0, 1.0)
 
         # Frame rendering objects (populated by _updateFrame)
         self._frameLines = None
@@ -775,15 +779,20 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
     def _updateFrame(self):
         """Update axes, ticks, grid, labels in screen space."""
-        # Clear previous frame objects
-        for child in list(self._screenScene.children):
-            self._screenScene.remove(child)
+        # Update background color only when changed
+        bgColor = self._backgroundColor
+        if self._cachedBgColor != bgColor:
+            self._screenBg.material = gfx.BackgroundMaterial(
+                gfx.Color(*bgColor)
+            )
+            self._cachedBgColor = bgColor
 
-        # Re-add background (cleared above)
-        bgColor = gfx.Color(*self._backgroundColor)
-        self._screenScene.add(
-            gfx.Background(None, gfx.BackgroundMaterial(bgColor))
-        )
+        if not self._plotFrame.isDirty:
+            return  # Frame unchanged, keep cached objects
+
+        # Clear previous frame objects (frame group only, not markers/crosshair)
+        for child in list(self._screenFrameGroup.children):
+            self._screenFrameGroup.remove(child)
 
         if self._plotFrame.margins == self._plotFrame._NoDisplayMargins:
             return
@@ -814,7 +823,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
             )
             mat = gfx.LineSegmentMaterial(thickness=1.0, color=gridColor)
             gridLine = gfx.Line(geom, mat)
-            self._screenScene.add(gridLine)
+            self._screenFrameGroup.add(gridLine)
 
         # Render frame lines (axes)
         if len(vertices) >= 2:
@@ -827,7 +836,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
             )
             mat = gfx.LineSegmentMaterial(thickness=1.0, color=fgColor)
             frameLine = gfx.Line(geom, mat)
-            self._screenScene.add(frameLine)
+            self._screenFrameGroup.add(frameLine)
 
         # Render text labels (tick labels, axis titles, main title)
         for labelDict in labelDicts:
@@ -874,7 +883,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                     (0, 0, 1), math.radians(-rotate)
                 )
 
-            self._screenScene.add(textObj)
+            self._screenFrameGroup.add(textObj)
 
     def _updateMarkers(self):
         """Update marker lines and text labels in screen space."""
