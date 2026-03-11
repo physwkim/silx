@@ -28,7 +28,7 @@ def main():
     )
     data = numpy.sin(xx) * numpy.cos(yy)
 
-    imageData = sceneWidget = scene.addImage(data.astype(numpy.float32))
+    imageData = scene.addImage(data.astype(numpy.float32))
     imageData.setLabel("Grayscale (magma)")
     imageData.getColormap().setName("magma")
     imageData.setInterpolation("linear")

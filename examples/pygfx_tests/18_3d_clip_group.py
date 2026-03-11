@@ -62,9 +62,7 @@ def main():
 
     # Add an unclipped reference box outside the group
     box = items.Box()
-    box.setData(size=(10, 10, 10))
-    box.setColor((0.5, 0.9, 0.5, 0.5))
-    box.setTranslation(80, 32, 32)
+    box.setData(size=(10, 10, 10), color=(0.5, 0.9, 0.5), position=(80, 32, 32))
     box.setLabel("Unclipped box")
     scene.addItem(box)
 

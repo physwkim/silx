@@ -82,25 +82,19 @@ def main():
 
     # Box primitive
     box = items.Box()
-    box.setData(size=(2, 2, 2))
-    box.setColor((0.2, 0.8, 0.3, 0.8))
-    box.setTranslation(5, 0, 0)
+    box.setData(size=(2, 2, 2), color=(0.2, 0.8, 0.3), position=(5, 0, 0))
     box.setLabel("Box")
     scene.addItem(box)
 
     # Cylinder primitive
     cylinder = items.Cylinder()
-    cylinder.setData(radius=1.0, height=3.0)
-    cylinder.setColor((0.8, 0.3, 0.2, 0.8))
-    cylinder.setTranslation(10, 0, 0)
+    cylinder.setData(radius=1.0, height=3.0, color=(0.8, 0.3, 0.2), position=(10, 0, 0))
     cylinder.setLabel("Cylinder")
     scene.addItem(cylinder)
 
     # Hexagon primitive
     hexagon = items.Hexagon()
-    hexagon.setData(radius=1.5, height=2.0)
-    hexagon.setColor((0.3, 0.3, 0.9, 0.8))
-    hexagon.setTranslation(15, 0, 0)
+    hexagon.setData(radius=1.5, height=2.0, color=(0.3, 0.3, 0.9), position=(15, 0, 0))
     hexagon.setLabel("Hexagon")
     scene.addItem(hexagon)
 
