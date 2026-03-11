@@ -508,61 +508,42 @@ class _PygfxShapeItem(dict):
 
         # Build fill for closed shapes
         if fill and shape in ("polygon", "rectangle") and len(x) >= 3:
-            fillObj = self._buildHatchFill(x, y, rgba)
+            fillObj = self._buildPolygonFill(x, y, rgba)
             if fillObj is not None:
                 fillObj.local.z = -0.2  # behind lines
                 self.group.add(fillObj)
 
     @staticmethod
-    def _buildHatchFill(x, y, rgba):
-        """Create a hatch-pattern fill using diagonal lines."""
-        xMin, xMax = float(numpy.nanmin(x)), float(numpy.nanmax(x))
-        yMin, yMax = float(numpy.nanmin(y)), float(numpy.nanmax(y))
-
-        dx = xMax - xMin
-        dy = yMax - yMin
-        if dx <= 0 or dy <= 0:
+    def _buildPolygonFill(x, y, rgba):
+        """Create a semi-transparent polygon fill using a triangle fan mesh."""
+        n = len(x)
+        if n < 3:
             return None
 
-        # Hatch spacing: ~8 pixels worth in data coords
-        # Use a fraction of the smaller dimension
-        step = min(dx, dy) / 20.0
-        if step <= 0:
-            return None
+        # Sort vertices by angle from centroid to avoid bowtie patterns
+        cx, cy = numpy.nanmean(x), numpy.nanmean(y)
+        angles = numpy.arctan2(y - cy, x - cx)
+        order = numpy.argsort(angles)
+        x = x[order]
+        y = y[order]
 
-        # Build diagonal lines from bottom-left to top-right
-        segments = []
-        span = dx + dy
-        t = step
-        while t < span:
-            # Line from (xMin + t, yMin) clipped to the rectangle
-            x0 = xMin + t
-            y0 = yMin
-            x1 = xMin + t - dy
-            y1 = yMax
+        # Triangle fan from vertex 0
+        positions = numpy.zeros((n, 3), dtype=numpy.float32)
+        positions[:, 0] = x
+        positions[:, 1] = y
 
-            # Clip to x bounds
-            if x0 > xMax:
-                y0 = yMin + (x0 - xMax)
-                x0 = xMax
-            if x1 < xMin:
-                y1 = yMax - (xMin - x1)
-                x1 = xMin
+        indices = numpy.zeros(((n - 2), 3), dtype=numpy.uint32)
+        for i in range(n - 2):
+            indices[i] = [0, i + 1, i + 2]
 
-            if y0 <= yMax and y1 >= yMin:
-                segments.append([x0, y0, 0])
-                segments.append([x1, y1, 0])
-
-            t += step
-
-        if len(segments) < 2:
-            return None
-
-        positions = numpy.array(segments, dtype=numpy.float32)
-        fillColor = gfx.Color(rgba[0], rgba[1], rgba[2], rgba[3])
-        geom = gfx.Geometry(positions=positions)
-        mat = gfx.LineSegmentMaterial(thickness=1.0, color=fillColor)
-        return gfx.Line(geom, mat)
+        fillColor = gfx.Color(rgba[0], rgba[1], rgba[2], 0.3)
+        geom = gfx.Geometry(indices=indices, positions=positions)
+        mat = gfx.MeshBasicMaterial(
+            color=fillColor,
+            side="both",
+            depth_write=False,
+        )
+        return gfx.Mesh(geom, mat)
 
 
 class _PygfxMarkerItem(dict):
@@ -641,6 +622,9 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         layout = qt.QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         self.setLayout(layout)
+
+        # Accept mouse events without requiring focus first (match OpenGL backend)
+        self.setFocusPolicy(qt.Qt.NoFocus)
 
         # Raise max FPS for responsive interaction (zoom, pan, drag)
         self.set_update_mode("ondemand", max_fps=240)
@@ -1084,6 +1068,15 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
     def minimumSizeHint(self):
         return qt.QSize(0, 0)
+
+    def enterEvent(self, event):
+        # WA_NativeWindow (from screen present mode) requires OS-level focus.
+        # Activate the top-level window when the mouse enters so that
+        # mouse events and cursor changes work without an extra click.
+        topLevel = self.window()
+        if topLevel is not None:
+            topLevel.activateWindow()
+        super().enterEvent(event)
 
     def mousePressEvent(self, event):
         if event.button() not in self._MOUSE_BTNS:
