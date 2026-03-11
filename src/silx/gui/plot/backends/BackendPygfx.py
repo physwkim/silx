@@ -180,17 +180,18 @@ class _PygfxCurveItem:
             self._lineObj = gfx.Line(geom, mat)
             self.group.add(self._lineObj)
 
-            # Gap color line (behind the dashed line)
+            # Gap color line (behind the dashed line via z-offset)
             if gapcolor is not None and dashPattern:
+                gapPositions = positions.copy()
+                gapPositions[:, 2] = -0.1  # slightly behind
                 gapRgba = colors.rgba(gapcolor)
                 gapMat = gfx.LineMaterial(
                     thickness=max(linewidth, 1.0),
                     color=gfx.Color(*gapRgba),
                 )
                 self._gapLineObj = gfx.Line(
-                    gfx.Geometry(positions=positions.copy()), gapMat
+                    gfx.Geometry(positions=gapPositions), gapMat
                 )
-                self._gapLineObj.render_order = -1
                 self.group.add(self._gapLineObj)
 
         # Symbol / Points
@@ -241,7 +242,7 @@ class _PygfxCurveItem:
         if fill and len(x) >= 2:
             self._fillObj = self._buildFill(x, y, baseline, uniformColor, alpha)
             if self._fillObj is not None:
-                self._fillObj.render_order = -2
+                self._fillObj.local.z = -0.2  # behind curve line
                 self.group.add(self._fillObj)
 
     @staticmethod
@@ -482,6 +483,20 @@ class _PygfxShapeItem(dict):
             positions[:, 1] = y
 
         if len(positions) >= 2:
+            # Gap color line: solid line behind the dashed foreground line.
+            # Must be at a lower z to pass the strict '<' depth test.
+            if gapcolor is not None and dashPattern:
+                gapPositions = positions.copy()
+                gapPositions[:, 2] = -0.1  # slightly behind
+                gapRgba = colors.rgba(gapcolor)
+                gapMat = gfx.LineMaterial(
+                    thickness=max(linewidth, 1.0),
+                    color=gfx.Color(*gapRgba),
+                )
+                gapLineObj = gfx.Line(gfx.Geometry(positions=gapPositions), gapMat)
+                self.group.add(gapLineObj)
+
+            # Foreground line (dashed or solid) at z=0 (in front of gap line)
             geom = gfx.Geometry(positions=positions)
             mat = gfx.LineMaterial(
                 thickness=max(linewidth, 1.0),
@@ -491,50 +506,63 @@ class _PygfxShapeItem(dict):
             lineObj = gfx.Line(geom, mat)
             self.group.add(lineObj)
 
-            # Gap color line
-            if gapcolor is not None and dashPattern:
-                gapRgba = colors.rgba(gapcolor)
-                gapMat = gfx.LineMaterial(
-                    thickness=max(linewidth, 1.0),
-                    color=gfx.Color(*gapRgba),
-                )
-                gapLineObj = gfx.Line(
-                    gfx.Geometry(positions=positions.copy()), gapMat
-                )
-                gapLineObj.render_order = -1
-                self.group.add(gapLineObj)
-
         # Build fill for closed shapes
         if fill and shape in ("polygon", "rectangle") and len(x) >= 3:
-            fillMesh = self._buildFilledShape(x, y, rgba)
-            if fillMesh is not None:
-                fillMesh.render_order = -1
-                self.group.add(fillMesh)
+            fillObj = self._buildHatchFill(x, y, rgba)
+            if fillObj is not None:
+                fillObj.local.z = -0.2  # behind lines
+                self.group.add(fillObj)
 
     @staticmethod
-    def _buildFilledShape(x, y, rgba):
-        """Create a filled mesh using ear-clipping triangulation."""
-        n = len(x)
-        if n < 3:
+    def _buildHatchFill(x, y, rgba):
+        """Create a hatch-pattern fill using diagonal lines."""
+        xMin, xMax = float(numpy.nanmin(x)), float(numpy.nanmax(x))
+        yMin, yMax = float(numpy.nanmin(y)), float(numpy.nanmax(y))
+
+        dx = xMax - xMin
+        dy = yMax - yMin
+        if dx <= 0 or dy <= 0:
             return None
 
-        positions = numpy.zeros((n, 3), dtype=numpy.float32)
-        positions[:, 0] = x
-        positions[:, 1] = y
-
-        # Simple fan triangulation (works for convex shapes)
-        indices = []
-        for i in range(1, n - 1):
-            indices.append([0, i, i + 1])
-
-        if not indices:
+        # Hatch spacing: ~8 pixels worth in data coords
+        # Use a fraction of the smaller dimension
+        step = min(dx, dy) / 20.0
+        if step <= 0:
             return None
 
-        indices = numpy.array(indices, dtype=numpy.int32)
-        fillColor = gfx.Color(rgba[0], rgba[1], rgba[2], rgba[3] * 0.5)
-        geom = gfx.Geometry(positions=positions, indices=indices)
-        mat = gfx.MeshBasicMaterial(color=fillColor, side="both")
-        return gfx.Mesh(geom, mat)
+        # Build diagonal lines from bottom-left to top-right
+        segments = []
+        span = dx + dy
+        t = step
+        while t < span:
+            # Line from (xMin + t, yMin) clipped to the rectangle
+            x0 = xMin + t
+            y0 = yMin
+            x1 = xMin + t - dy
+            y1 = yMax
+
+            # Clip to x bounds
+            if x0 > xMax:
+                y0 = yMin + (x0 - xMax)
+                x0 = xMax
+            if x1 < xMin:
+                y1 = yMax - (xMin - x1)
+                x1 = xMin
+
+            if y0 <= yMax and y1 >= yMin:
+                segments.append([x0, y0, 0])
+                segments.append([x1, y1, 0])
+
+            t += step
+
+        if len(segments) < 2:
+            return None
+
+        positions = numpy.array(segments, dtype=numpy.float32)
+        fillColor = gfx.Color(rgba[0], rgba[1], rgba[2], rgba[3])
+        geom = gfx.Geometry(positions=positions)
+        mat = gfx.LineSegmentMaterial(thickness=1.0, color=fillColor)
+        return gfx.Line(geom, mat)
 
 
 class _PygfxMarkerItem(dict):
@@ -631,6 +659,10 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         self._dataGroup = gfx.Group()
         self._overlayGroup = gfx.Group()
         self._frameGroup = gfx.Group()
+
+        # Shift overlays forward in z so they always render in front of data.
+        # Camera z-range is wide (near=-100..far=100), so z=10 is safe.
+        self._overlayGroup.local.z = 10
 
         self._scene.add(self._bgGroup)
         self._scene.add(self._dataGroup)
@@ -754,6 +786,12 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         # Clear previous frame objects
         for child in list(self._screenScene.children):
             self._screenScene.remove(child)
+
+        # Re-add background (cleared above)
+        bgColor = gfx.Color(*self._backgroundColor)
+        self._screenScene.add(
+            gfx.Background(None, gfx.BackgroundMaterial(bgColor))
+        )
 
         if self._plotFrame.margins == self._plotFrame._NoDisplayMargins:
             return
@@ -961,12 +999,83 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
             int(self.height() * dpr),
         )
 
+    # Backend API: Log transform helpers #####################################
+
+    def _logTransformX(self, x):
+        """Apply log10 if X axis is log scale."""
+        if not self._plotFrame.xAxis.isLog:
+            return x
+        x = numpy.array(x, copy=True, dtype=numpy.float64)
+        mask = x < FLOAT32_MINPOS
+        x[mask] = numpy.nan
+        with numpy.errstate(divide="ignore"):
+            return numpy.log10(x).astype(numpy.float32)
+
+    def _logTransformY(self, y, yaxis="left"):
+        """Apply log10 if Y axis is log scale."""
+        isLog = (
+            self._plotFrame.yAxis.isLog
+            if yaxis == "left"
+            else self._plotFrame.y2Axis.isLog
+        )
+        if not isLog:
+            return y
+        y = numpy.array(y, copy=True, dtype=numpy.float64)
+        mask = y < FLOAT32_MINPOS
+        y[mask] = numpy.nan
+        with numpy.errstate(divide="ignore"):
+            return numpy.log10(y).astype(numpy.float32)
+
     # Backend API: Add methods ##############################################
 
     def addCurve(
         self, x, y, color, gapcolor, symbol, linewidth, linestyle,
         yaxis, xerror, yerror, fill, alpha, symbolsize, baseline,
     ):
+        x = numpy.asarray(x, dtype=numpy.float64)
+        y = numpy.asarray(y, dtype=numpy.float64)
+
+        # Log transform errors before coordinates
+        if self._plotFrame.xAxis.isLog and xerror is not None:
+            xerror = numpy.asarray(xerror, dtype=numpy.float32)
+            logX = numpy.log10(x)
+            if xerror.ndim == 2:
+                xErrMinus, xErrPlus = xerror[0], xerror[1]
+            else:
+                xErrMinus, xErrPlus = xerror, xerror
+            with numpy.errstate(divide="ignore", invalid="ignore"):
+                xErrMinus = logX - numpy.log10(x - xErrMinus)
+            xErrPlus = numpy.log10(x + xErrPlus) - logX
+            xerror = numpy.array((xErrMinus, xErrPlus), dtype=numpy.float32)
+
+        isYLog = (yaxis == "left" and self._plotFrame.yAxis.isLog) or (
+            yaxis == "right" and self._plotFrame.y2Axis.isLog
+        )
+        if isYLog and yerror is not None:
+            yerror = numpy.asarray(yerror, dtype=numpy.float32)
+            logY = numpy.log10(y)
+            if yerror.ndim == 2:
+                yErrMinus, yErrPlus = yerror[0], yerror[1]
+            else:
+                yErrMinus, yErrPlus = yerror, yerror
+            with numpy.errstate(divide="ignore", invalid="ignore"):
+                yErrMinus = logY - numpy.log10(y - yErrMinus)
+            yErrPlus = numpy.log10(y + yErrPlus) - logY
+            yerror = numpy.array((yErrMinus, yErrPlus), dtype=numpy.float32)
+
+        x = self._logTransformX(x)
+        y = self._logTransformY(y, yaxis)
+
+        if baseline is not None and isYLog:
+            if isinstance(baseline, numpy.ndarray):
+                baseline = self._logTransformY(baseline, yaxis)
+            else:
+                bl = float(baseline)
+                if bl > 0:
+                    baseline = math.log10(bl)
+                else:
+                    baseline = numpy.nan
+
         item = _PygfxCurveItem(
             x, y, color, gapcolor, symbol, linewidth, linestyle,
             yaxis, xerror, yerror, fill, alpha, symbolsize, baseline,
@@ -975,11 +1084,36 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         return item
 
     def addImage(self, data, origin, scale, colormap, alpha):
-        item = _PygfxImageItem(data, origin, scale, colormap, alpha)
+        data = numpy.asarray(data)
+        ox, oy = origin
+        sx, sy = scale
+        h, w = data.shape[:2]
+
+        if self._plotFrame.xAxis.isLog:
+            xMin = ox
+            xMax = ox + w * sx
+            if xMin > 0 and xMax > 0:
+                logXMin = math.log10(xMin)
+                logXMax = math.log10(xMax)
+                ox = logXMin
+                sx = (logXMax - logXMin) / w
+
+        if self._plotFrame.yAxis.isLog:
+            yMin = oy
+            yMax = oy + h * sy
+            if yMin > 0 and yMax > 0:
+                logYMin = math.log10(yMin)
+                logYMax = math.log10(yMax)
+                oy = logYMin
+                sy = (logYMax - logYMin) / h
+
+        item = _PygfxImageItem(data, (ox, oy), (sx, sy), colormap, alpha)
         self._dataGroup.add(item.group)
         return item
 
     def addTriangles(self, x, y, triangles, color, alpha):
+        x = self._logTransformX(numpy.asarray(x, dtype=numpy.float64))
+        y = self._logTransformY(numpy.asarray(y, dtype=numpy.float64))
         item = _PygfxTrianglesItem(x, y, triangles, color, alpha)
         self._dataGroup.add(item.group)
         return item
@@ -987,6 +1121,17 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
     def addShape(
         self, x, y, shape, color, fill, overlay, linestyle, linewidth, gapcolor,
     ):
+        x = numpy.asarray(x, dtype=numpy.float64)
+        y = numpy.asarray(y, dtype=numpy.float64)
+        if not overlay:
+            # Non-overlay shapes have coordinates in original data space;
+            # overlay shapes get coordinates from pixelToData which already
+            # returns values in the camera's (log-transformed) space.
+            x = self._logTransformX(x)
+            y = self._logTransformY(y)
+        # Ensure overlay outlines (e.g. zoom selection) are clearly visible
+        if overlay and linewidth < 2.0:
+            linewidth = 2.0
         item = _PygfxShapeItem(
             x, y, shape, color, fill, overlay, linewidth, linestyle, gapcolor,
         )
@@ -1011,6 +1156,18 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         font: qt.QFont,
         bgcolor: RGBAColorType | None,
     ) -> object:
+        # Log transform marker coordinates
+        if x is not None and self._plotFrame.xAxis.isLog:
+            x = math.log10(x) if x > 0 else numpy.nan
+        if y is not None:
+            isYLog = (
+                self._plotFrame.yAxis.isLog
+                if yaxis == "left"
+                else self._plotFrame.y2Axis.isLog
+            )
+            if isYLog:
+                y = math.log10(y) if y > 0 else numpy.nan
+
         item = _PygfxMarkerItem(
             x, y, text, color, symbol, symbolsize, linewidth,
             linestyle, constraint, yaxis, font, bgcolor,
@@ -1224,10 +1381,10 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         return self
 
     def postRedisplay(self):
-        self.update()
+        self.request_draw(self._draw)
 
     def replot(self):
-        self.update()
+        self.request_draw(self._draw)
 
     def saveGraph(self, fileName, fileFormat, dpi):
         if dpi is not None:
@@ -1439,11 +1596,10 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
             if self._bgObj in self._scene.children:
                 self._scene.remove(self._bgObj)
 
-        # Update scene background
-        if backgroundColor is not None:
-            bgColor = gfx.Color(*backgroundColor)
+        # Update data scene background (plot area uses dataBackgroundColor)
+        if dataBackgroundColor is not None:
+            bgColor = gfx.Color(*dataBackgroundColor)
             self._bgObj = gfx.Background(None, gfx.BackgroundMaterial(bgColor))
-            # Insert at the beginning so it's behind everything
             self._scene.add(self._bgObj)
         else:
             self._bgObj = None
