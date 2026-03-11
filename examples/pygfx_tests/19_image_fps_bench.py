@@ -45,7 +45,6 @@ class ImageBenchmark(qt.QWidget):
         cmap.setName("viridis")
         self._plot.getColorBarWidget().setVisible(False)
         layout.addWidget(self._plot)
-        self._imageItem = None  # cached backend image item for direct update
 
         self._results = []
         self._queue = list(self._sizes)
@@ -75,11 +74,9 @@ class ImageBenchmark(qt.QWidget):
         # Warm-up frame (full addImage to create GPU objects)
         img = _generate_image(self._cur_size, self._rng)
         self._plot.addImage(img, resetzoom=True)
-        # Force synchronous replot so _backendRenderer is populated
+        # Force synchronous replot so backend renderer is populated
         self._plot._backend._draw()
         qt.QApplication.processEvents()
-        # Cache the backend image item for direct texture updates
-        self._imageItem = self._plot.getActiveImage()._backendRenderer
 
         self._bench_start = time.perf_counter()
         self._timer.start(0)
@@ -91,8 +88,8 @@ class ImageBenchmark(qt.QWidget):
         img = _generate_image(self._cur_size, self._rng)
         t1 = time.perf_counter()
 
-        # Direct texture update (bypasses item system entirely)
-        self._imageItem.updateData(img, autoclim=True)
+        # Update via public API (uses fast path when backend supports it)
+        self._plot.updateImageData(img)
         self._plot._backend._draw()
         t2 = time.perf_counter()
 

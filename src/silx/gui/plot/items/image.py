@@ -376,24 +376,45 @@ class ImageDataBase(ImageBase, ColormapMixIn):
     def _updated(self, event=None, checkVisibility=True):
         # Synchronizes colormapped data if changed
         if event in (ItemChangedType.DATA, ItemChangedType.MASK):
-            # Skip CPU colormap pipeline when backend handles it on GPU
-            plot = self.getPlot()
-            backend = getattr(plot, '_backend', None) if plot else None
-            if not getattr(backend, 'GPU_COLORMAP', False):
-                data = self.getValueData(copy=False)
-                if data is not None and data.size > 0:
-                    cb = getattr(plot, 'getColorBarWidget', None) if plot else None
-                    if cb is not None and cb().isVisible():
-                        min_ = float(numpy.nanmin(data))
-                        max_ = float(numpy.nanmax(data))
-                        self._setColormappedData(
-                            data, copy=False, min_=min_, max_=max_,
-                        )
-                    else:
-                        self._setColormappedData(data, copy=False)
-                else:
-                    self._setColormappedData(data, copy=False)
+            self._setColormappedData(self.getValueData(copy=False), copy=False)
         super()._updated(event=event, checkVisibility=checkVisibility)
+
+    def updateData(self, data):
+        """Update image data for streaming without full pipeline rebuild.
+
+        Optimized for repeated updates of same-shape data.
+        Bypasses the item dirty/remove/add cycle by updating the backend
+        renderer directly when supported.
+
+        Falls back to setData() if no fast path is available.
+        """
+        data = numpy.asarray(data)
+
+        renderer = self._backendRenderer
+        if renderer is None or not hasattr(renderer, 'updateData'):
+            self.setData(data, copy=False)
+            return
+
+        # Compute clim from colormap settings
+        colormap = self.getColormap()
+        vmin, vmax = colormap.getVMin(), colormap.getVMax()
+        if vmin is None or vmax is None:
+            dmin = float(numpy.nanmin(data))
+            dmax = float(numpy.nanmax(data))
+            if dmin >= dmax:
+                dmax = dmin + 1.0
+            vmin = float(vmin) if vmin is not None else dmin
+            vmax = float(vmax) if vmax is not None else dmax
+        else:
+            vmin, vmax = float(vmin), float(vmax)
+
+        # Direct backend update (no item system overhead)
+        renderer.updateData(data, clim=(vmin, vmax))
+
+        # Schedule redraw
+        plot = self.getPlot()
+        if plot is not None:
+            plot._setDirtyPlot()
 
 
 class ImageData(ImageDataBase):

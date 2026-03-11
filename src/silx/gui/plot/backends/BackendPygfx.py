@@ -403,13 +403,13 @@ class _PygfxImageItem:
         self._imageObj.local.position = (ox, oy, 0)
         self._imageObj.local.scale = (sx, sy, 1)
 
-    def updateData(self, data, autoclim=False):
+    def updateData(self, data, clim=None):
         """Fast path: update only the texture data (no item system overhead).
 
         Requires the image object to already exist and data shape to match.
 
         :param data: New image data (2D array)
-        :param autoclim: If True, recompute clim from data (nanmin/nanmax)
+        :param clim: (vmin, vmax) tuple for color limits, or None to keep current
         """
         if self._imageObj is None:
             return
@@ -418,12 +418,8 @@ class _PygfxImageItem:
         else:
             scalarData = numpy.ascontiguousarray(data, dtype=numpy.float32)
         self._imageObj.geometry.grid.set_data(scalarData)
-        if autoclim:
-            vmin = float(numpy.nanmin(data))
-            vmax = float(numpy.nanmax(data))
-            if vmin >= vmax:
-                vmax = vmin + 1.0
-            self._imageObj.material.clim = (vmin, vmax)
+        if clim is not None:
+            self._imageObj.material.clim = clim
 
     def _buildRGBA(self, data, origin, scale, alpha):
         self._scalarShape = None
@@ -699,7 +695,6 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
     Uses pygfx for GPU-accelerated rendering via WGPU (Vulkan/Metal/DX12).
     """
 
-    GPU_COLORMAP = True
     _TEXT_MARKER_PADDING = 4
 
     def __init__(self, plot, parent=None):

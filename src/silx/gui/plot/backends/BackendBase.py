@@ -51,8 +51,6 @@ CURSOR_SIZE_ALL = "size all"
 class BackendBase:
     """Class defining the API a backend of the Plot should provide."""
 
-    GPU_COLORMAP = False
-
     def __init__(self, plot, parent=None):
         """Init.
 
