@@ -376,7 +376,23 @@ class ImageDataBase(ImageBase, ColormapMixIn):
     def _updated(self, event=None, checkVisibility=True):
         # Synchronizes colormapped data if changed
         if event in (ItemChangedType.DATA, ItemChangedType.MASK):
-            self._setColormappedData(self.getValueData(copy=False), copy=False)
+            # Skip CPU colormap pipeline when backend handles it on GPU
+            plot = self.getPlot()
+            backend = getattr(plot, '_backend', None) if plot else None
+            if not getattr(backend, 'GPU_COLORMAP', False):
+                data = self.getValueData(copy=False)
+                if data is not None and data.size > 0:
+                    cb = getattr(plot, 'getColorBarWidget', None) if plot else None
+                    if cb is not None and cb().isVisible():
+                        min_ = float(numpy.nanmin(data))
+                        max_ = float(numpy.nanmax(data))
+                        self._setColormappedData(
+                            data, copy=False, min_=min_, max_=max_,
+                        )
+                    else:
+                        self._setColormappedData(data, copy=False)
+                else:
+                    self._setColormappedData(data, copy=False)
         super()._updated(event=event, checkVisibility=checkVisibility)
 
 

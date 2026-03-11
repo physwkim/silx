@@ -314,75 +314,162 @@ class _PygfxCurveItem:
         return gfx.Mesh(geom, mat)
 
 
+def _fastColormapRange(data, colormap):
+    """Fast colormap range for common cases (avoids slow normalizer pipeline)."""
+    vmin = colormap.getVMin()
+    vmax = colormap.getVMax()
+    if vmin is not None and vmax is not None:
+        return float(vmin), float(vmax)
+
+    # Fast path for linear + minmax (most common streaming case)
+    norm = colormap.getNormalization()
+    mode = colormap.getAutoscaleMode()
+    if norm == "linear" and mode == "minmax":
+        if vmin is None:
+            vmin = float(numpy.nanmin(data))
+        if vmax is None:
+            vmax = float(numpy.nanmax(data))
+        if vmin >= vmax:
+            vmax = vmin + 1.0
+        return vmin, vmax
+
+    # Fallback to full pipeline (log, sqrt, percentile, etc.)
+    return colormap.getColormapRange(data)
+
+
 class _PygfxImageItem:
     """Manages pygfx scene objects for a single image."""
 
     def __init__(self, data, origin, scale, colormap, alpha):
         self.group = gfx.Group()
         self.yaxis = "left"
+        self._imageObj = None
+        self._scalarShape = None
+        self._cmapName = None
+        self._cmapTexture = None
 
+        self._build(data, origin, scale, colormap, alpha)
+
+    def _build(self, data, origin, scale, colormap, alpha):
         data = numpy.asarray(data)
 
         if data.ndim == 2:
-            # Scalar data - apply colormap on CPU
-            if colormap is not None:
-                rgbaData = colormap.applyToData(data)
-            else:
-                # Fallback: normalize to grayscale
-                vmin, vmax = numpy.nanmin(data), numpy.nanmax(data)
-                if vmin == vmax:
-                    normalized = numpy.zeros_like(data, dtype=numpy.uint8)
-                else:
-                    normalized = (
-                        (data - vmin) / (vmax - vmin) * 255
-                    ).astype(numpy.uint8)
-                rgbaData = numpy.stack(
-                    [normalized, normalized, normalized,
-                     numpy.full_like(normalized, 255)],
-                    axis=-1,
-                )
+            self._buildScalar(data, origin, scale, colormap, alpha)
         elif data.ndim == 3 and data.shape[2] in (3, 4):
-            if data.dtype == numpy.float64:
-                data = data.astype(numpy.float32)
-            if data.dtype in (numpy.float32, numpy.float64):
-                rgbaData = (numpy.clip(data, 0, 1) * 255).astype(numpy.uint8)
-            else:
-                rgbaData = numpy.asarray(data, dtype=numpy.uint8)
-            if rgbaData.shape[2] == 3:
-                alphaChannel = numpy.full(
-                    rgbaData.shape[:2] + (1,), 255, dtype=numpy.uint8
-                )
-                rgbaData = numpy.concatenate([rgbaData, alphaChannel], axis=-1)
+            self._buildRGBA(data, origin, scale, alpha)
         else:
             _logger.warning("Unsupported image data shape: %s", data.shape)
+
+    def _buildScalar(self, data, origin, scale, colormap, alpha):
+        self._scalarShape = data.shape
+
+        # Data: upload scalar float32 directly (no CPU colormap)
+        if data.dtype == numpy.float32 and data.flags["C_CONTIGUOUS"]:
+            scalarData = data
+        else:
+            scalarData = numpy.ascontiguousarray(data, dtype=numpy.float32)
+
+        # Range: fast path for linear+minmax
+        if colormap is not None:
+            vmin, vmax = _fastColormapRange(data, colormap)
+            cmapTex = self._getOrCreateCmapTexture(colormap, alpha)
+        else:
+            vmin = float(numpy.nanmin(data))
+            vmax = float(numpy.nanmax(data))
+            if vmin == vmax:
+                vmax = vmin + 1.0
+            cmapTex = None
+
+        if self._imageObj is None:
+            # First time: create GPU objects
+            tex = gfx.Texture(scalarData, dim=2)
+            geom = gfx.Geometry(grid=tex)
+            mat = gfx.ImageBasicMaterial(
+                clim=(vmin, vmax),
+                map=cmapTex,
+                interpolation="nearest",
+            )
+            self._imageObj = gfx.Image(geom, mat)
+            self.group.add(self._imageObj)
+        else:
+            # Reuse: update texture data + clim (no GPU object creation)
+            self._imageObj.geometry.grid.set_data(scalarData)
+            self._imageObj.material.clim = (vmin, vmax)
+            if cmapTex is not None:
+                self._imageObj.material.map = cmapTex
+
+        ox, oy = origin
+        sx, sy = scale
+        self._imageObj.local.position = (ox, oy, 0)
+        self._imageObj.local.scale = (sx, sy, 1)
+
+    def updateData(self, data, autoclim=False):
+        """Fast path: update only the texture data (no item system overhead).
+
+        Requires the image object to already exist and data shape to match.
+
+        :param data: New image data (2D array)
+        :param autoclim: If True, recompute clim from data (nanmin/nanmax)
+        """
+        if self._imageObj is None:
             return
+        if data.dtype == numpy.float32 and data.flags["C_CONTIGUOUS"]:
+            scalarData = data
+        else:
+            scalarData = numpy.ascontiguousarray(data, dtype=numpy.float32)
+        self._imageObj.geometry.grid.set_data(scalarData)
+        if autoclim:
+            vmin = float(numpy.nanmin(data))
+            vmax = float(numpy.nanmax(data))
+            if vmin >= vmax:
+                vmax = vmin + 1.0
+            self._imageObj.material.clim = (vmin, vmax)
 
-        # Convert to float32 [0, 1] to avoid pygfx climcorrection issues
-        # (rgba8unorm triggers * 255.0 in shader which breaks with default maprange)
+    def _buildRGBA(self, data, origin, scale, alpha):
+        self._scalarShape = None
+
+        if data.dtype == numpy.float64:
+            data = data.astype(numpy.float32)
+        if data.dtype in (numpy.float32, numpy.float64):
+            rgbaData = (numpy.clip(data, 0, 1) * 255).astype(numpy.uint8)
+        else:
+            rgbaData = numpy.asarray(data, dtype=numpy.uint8)
+        if rgbaData.shape[2] == 3:
+            alphaChannel = numpy.full(
+                rgbaData.shape[:2] + (1,), 255, dtype=numpy.uint8
+            )
+            rgbaData = numpy.concatenate([rgbaData, alphaChannel], axis=-1)
+
         rgbaFloat = rgbaData.astype(numpy.float32) / 255.0
-
-        # Apply alpha
         if alpha < 1.0:
             rgbaFloat = rgbaFloat.copy()
             rgbaFloat[:, :, 3] *= alpha
-
-        # pygfx Image maps texcoord (0,0) to the bottom-left of the quad,
-        # which matches silx's bottom-left origin convention. No flip needed.
         rgbaFloat = numpy.ascontiguousarray(rgbaFloat)
 
         geom = gfx.Geometry(grid=gfx.Texture(rgbaFloat, dim=2))
         mat = gfx.ImageBasicMaterial(interpolation="nearest")
         self._imageObj = gfx.Image(geom, mat)
+        self.group.add(self._imageObj)
 
-        # Position and scale
         ox, oy = origin
         sx, sy = scale
-        h, w = data.shape[:2]
-
         self._imageObj.local.position = (ox, oy, 0)
         self._imageObj.local.scale = (sx, sy, 1)
 
-        self.group.add(self._imageObj)
+    def _getOrCreateCmapTexture(self, colormap, alpha):
+        """Cache colormap LUT texture, recreate only when colormap changes."""
+        name = colormap.getName()
+        if name == self._cmapName and self._cmapTexture is not None:
+            return self._cmapTexture
+
+        lut = colormap.getNColors()  # (256, 4) uint8 RGBA
+        lutFloat = lut.astype(numpy.float32) / 255.0
+        if alpha < 1.0:
+            lutFloat = lutFloat.copy()
+            lutFloat[:, 3] *= alpha
+        self._cmapTexture = gfx.Texture(lutFloat, dim=1)
+        self._cmapName = name
+        return self._cmapTexture
 
 
 class _PygfxTrianglesItem:
@@ -612,6 +699,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
     Uses pygfx for GPU-accelerated rendering via WGPU (Vulkan/Metal/DX12).
     """
 
+    GPU_COLORMAP = True
     _TEXT_MARKER_PADDING = 4
 
     def __init__(self, plot, parent=None):
@@ -692,6 +780,8 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         # Crosshair cursor lines
         self._crosshairHLine = None
         self._crosshairVLine = None
+
+        self._reusableImageItem = None  # Pool for image item reuse
 
         self.request_draw(self._draw)
         self.setAutoFillBackground(False)
@@ -776,6 +866,11 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         # top=yMin, bottom=yMax → yMax at top of viewport, yMin at bottom
         extent = max(abs(xMax - xMin), abs(yMax - yMin), 1.0)
         self._camera.show_rect(xMin, xMax, yMin, yMax, depth=extent)
+
+        # Populate projection matrix caches so isDirty returns False
+        # (pygfx doesn't use OpenGL projection matrices, but isDirty checks them)
+        _ = self._plotFrame.transformedDataProjMat
+        _ = self._plotFrame.transformedDataY2ProjMat
 
     def _updateFrame(self):
         """Update axes, ticks, grid, labels in screen space."""
@@ -1251,6 +1346,19 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                 oy = logYMin
                 sy = (logYMax - logYMin) / h
 
+        # Reuse pooled item if shape matches (avoids GPU object recreation)
+        reuse = self._reusableImageItem
+        if (
+            reuse is not None
+            and data.ndim == 2
+            and reuse._scalarShape == data.shape
+        ):
+            self._reusableImageItem = None
+            reuse._build(data, (ox, oy), (sx, sy), colormap, alpha)
+            self._dataGroup.add(reuse.group)
+            return reuse
+
+        self._reusableImageItem = None
         item = _PygfxImageItem(data, (ox, oy), (sx, sy), colormap, alpha)
         self._dataGroup.add(item.group)
         return item
@@ -1326,6 +1434,10 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                     if isinstance(i, items.YAxisMixIn) and i.getYAxis() == "right"
                 )
                 self._plotFrame.isY2Axis = next(y2AxisItems, None) is not None
+
+            # Pool scalar image items for reuse (avoids GPU object recreation)
+            if isinstance(item, _PygfxImageItem) and item._scalarShape is not None:
+                self._reusableImageItem = item
 
             group = item.group
             if group.parent is not None:

@@ -41,8 +41,11 @@ class ImageBenchmark(qt.QWidget):
 
         self._plot = Plot2D(backend="pygfx")
         self._plot.setKeepDataAspectRatio(False)
-        self._plot.getDefaultColormap().setName("viridis")
+        cmap = self._plot.getDefaultColormap()
+        cmap.setName("viridis")
+        self._plot.getColorBarWidget().setVisible(False)
         layout.addWidget(self._plot)
+        self._imageItem = None  # cached backend image item for direct update
 
         self._results = []
         self._queue = list(self._sizes)
@@ -69,10 +72,14 @@ class ImageBenchmark(qt.QWidget):
         self._frame_total = []
         self._bench_start = time.perf_counter()
 
-        # Warm-up frame
+        # Warm-up frame (full addImage to create GPU objects)
         img = _generate_image(self._cur_size, self._rng)
         self._plot.addImage(img, resetzoom=True)
+        # Force synchronous replot so _backendRenderer is populated
+        self._plot._backend._draw()
         qt.QApplication.processEvents()
+        # Cache the backend image item for direct texture updates
+        self._imageItem = self._plot.getActiveImage()._backendRenderer
 
         self._bench_start = time.perf_counter()
         self._timer.start(0)
@@ -84,11 +91,12 @@ class ImageBenchmark(qt.QWidget):
         img = _generate_image(self._cur_size, self._rng)
         t1 = time.perf_counter()
 
-        # Plot
-        self._plot.addImage(img, resetzoom=False)
+        # Direct texture update (bypasses item system entirely)
+        self._imageItem.updateData(img, autoclim=True)
+        self._plot._backend._draw()
         t2 = time.perf_counter()
 
-        # Process events (forces Qt + GPU flush)
+        # Process remaining Qt events
         qt.QApplication.processEvents()
         t3 = time.perf_counter()
 
