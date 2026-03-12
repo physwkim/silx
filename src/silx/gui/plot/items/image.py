@@ -395,21 +395,7 @@ class ImageDataBase(ImageBase, ColormapMixIn):
             self.setData(data, copy=False)
             return
 
-        # Compute clim from colormap settings
-        colormap = self.getColormap()
-        vmin, vmax = colormap.getVMin(), colormap.getVMax()
-        if vmin is None or vmax is None:
-            dmin = float(numpy.nanmin(data))
-            dmax = float(numpy.nanmax(data))
-            if dmin >= dmax:
-                dmax = dmin + 1.0
-            vmin = float(vmin) if vmin is not None else dmin
-            vmax = float(vmax) if vmax is not None else dmax
-        else:
-            vmin, vmax = float(vmin), float(vmax)
-
-        # Direct backend update (no item system overhead)
-        renderer.updateData(data, clim=(vmin, vmax))
+        renderer.updateData(data)
 
         # Schedule redraw
         plot = self.getPlot()
