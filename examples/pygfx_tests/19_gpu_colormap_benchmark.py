@@ -1,10 +1,10 @@
 """GPU colormap performance benchmark for pygfx backend.
 
-Streams 2D image data at maximum rate and measures FPS,
-with per-frame timing breakdown:
-  gen_ms  - numpy image generation
-  plot_ms - updateImageData + GPU render (_draw)
-  other   - Qt event processing overhead
+Pre-generates image frames, then streams them at maximum rate
+to measure pure rendering throughput (no data generation overhead).
+
+  plot_ms - updateImageData + _draw() (GPU pipeline)
+  other   - Qt processEvents overhead
 
 Usage:
     python 19_gpu_colormap_benchmark.py
@@ -18,16 +18,22 @@ from silx.gui import qt
 from silx.gui.plot.PlotWindow import PlotWindow
 from silx.gui.colors import Colormap
 
+NUM_PREGEN_FRAMES = 20
 
-def _generate_image(size, t):
-    """Generate a test image with a moving Gaussian peak."""
-    cx = (np.sin(t) * 0.5 + 0.5) * size
-    cy = (np.cos(t) * 0.5 + 0.5) * size
-    sigma = size / 8
-    y, x = np.ogrid[:size, :size]
-    img = np.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * sigma ** 2))
-    img += 0.05 * np.random.random((size, size))
-    return img.astype(np.float32)
+
+def _pregenerate_frames(size, n=NUM_PREGEN_FRAMES):
+    """Pre-generate a pool of test frames."""
+    frames = []
+    for i in range(n):
+        t = i * 0.3
+        cx = (np.sin(t) * 0.5 + 0.5) * size
+        cy = (np.cos(t) * 0.5 + 0.5) * size
+        sigma = size / 8
+        y, x = np.ogrid[:size, :size]
+        img = np.exp(-((x - cx) ** 2 + (y - cy) ** 2) / (2 * sigma ** 2))
+        img += 0.05 * np.random.random((size, size))
+        frames.append(img.astype(np.float32))
+    return frames
 
 
 class StreamingBenchmark(qt.QWidget):
@@ -83,10 +89,9 @@ class StreamingBenchmark(qt.QWidget):
         self._results_text.setText(
             "Results will appear here after each run.\n"
             "Try different sizes and normalizations to compare.\n\n"
-            "gen_ms  = data generation (numpy)\n"
             "plot_ms = updateImageData + _draw() (GPU pipeline)\n"
             "other   = Qt processEvents overhead\n"
-            "total   = gen + plot + other (should ~ 1000/FPS)"
+            "total   = plot + other (should ~ 1000/FPS)"
         )
         layout.addWidget(self._results_text)
 
@@ -95,9 +100,9 @@ class StreamingBenchmark(qt.QWidget):
         self._timer.timeout.connect(self._tick)
         self._frame_count = 0
         self._t_start = 0.0
-        self._frame_gen = []
         self._frame_plot = []
         self._frame_other = []
+        self._frames = []
         self._results = []
 
         self._start_btn.clicked.connect(self._start)
@@ -121,13 +126,16 @@ class StreamingBenchmark(qt.QWidget):
         self._plot.setDefaultColormap(cm)
         self._image_size = size
         self._frame_count = 0
-        self._frame_gen = []
         self._frame_plot = []
         self._frame_other = []
 
+        # Pre-generate frames
+        self._status.setText(f"Generating {NUM_PREGEN_FRAMES} frames ({size}x{size})...")
+        qt.QApplication.processEvents()
+        self._frames = _pregenerate_frames(size)
+
         # Warm-up frame (full addImage to create GPU objects)
-        img = _generate_image(size, 0.0)
-        self._plot.addImage(img, legend="bench", resetzoom=True)
+        self._plot.addImage(self._frames[0], legend="bench", resetzoom=True)
         self._plot._backend._draw()
         qt.QApplication.processEvents()
 
@@ -144,14 +152,12 @@ class StreamingBenchmark(qt.QWidget):
     def _stop(self):
         self._timer.stop()
         elapsed = time.perf_counter() - self._t_start
-        n = max(len(self._frame_gen), 1)
+        n = max(len(self._frame_plot), 1)
         avg_fps = n / elapsed if elapsed > 0 else 0
 
-        gen = np.array(self._frame_gen) * 1000
         plot = np.array(self._frame_plot) * 1000
         other = np.array(self._frame_other) * 1000
 
-        avg_gen = float(np.mean(gen)) if len(gen) else 0
         avg_plot = float(np.mean(plot)) if len(plot) else 0
         avg_other = float(np.mean(other)) if len(other) else 0
 
@@ -159,20 +165,20 @@ class StreamingBenchmark(qt.QWidget):
         norm = self._norm_combo.currentText()
 
         self._results.append(
-            (size, norm, avg_fps, avg_gen, avg_plot, avg_other, n, elapsed)
+            (size, norm, avg_fps, avg_plot, avg_other, n, elapsed)
         )
 
         # Update results table
         lines = [
             f"{'Size':>6} {'Norm':>8} {'FPS':>7} "
-            f"{'gen_ms':>7} {'plot_ms':>8} {'other':>7} {'total':>7} "
+            f"{'plot_ms':>8} {'other':>7} {'total':>7} "
             f"{'Frames':>7} {'Time':>5}"
         ]
-        lines.append("-" * 74)
-        for s, no, fps, gm, pm, om, fr, t in self._results:
+        lines.append("-" * 62)
+        for s, no, fps, pm, om, fr, t in self._results:
             lines.append(
                 f"{s:>6} {no:>8} {fps:>7.1f} "
-                f"{gm:>7.2f} {pm:>8.2f} {om:>7.2f} {gm+pm+om:>7.2f} "
+                f"{pm:>8.2f} {om:>7.2f} {pm+om:>7.2f} "
                 f"{fr:>7} {t:>4.1f}s"
             )
         self._results_text.setText("\n".join(lines))
@@ -182,7 +188,7 @@ class StreamingBenchmark(qt.QWidget):
 
         self._status.setText(
             f"Done: {avg_fps:.1f} FPS | "
-            f"gen {avg_gen:.1f} + plot {avg_plot:.1f} + other {avg_other:.1f}ms"
+            f"plot {avg_plot:.1f} + other {avg_other:.1f}ms"
         )
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
@@ -190,45 +196,37 @@ class StreamingBenchmark(qt.QWidget):
         self._norm_combo.setEnabled(True)
 
     def _tick(self):
-        size = self._image_size
-        t = self._frame_count * 0.05
-
-        # --- Data generation ---
-        t0 = time.perf_counter()
-        img = _generate_image(size, t)
-        t1 = time.perf_counter()
+        img = self._frames[self._frame_count % len(self._frames)]
 
         # --- Plot update + GPU render ---
+        t0 = time.perf_counter()
         self._plot.updateImageData(img, legend="bench")
         self._plot._backend._draw()
-        t2 = time.perf_counter()
+        t1 = time.perf_counter()
 
         # --- Qt event processing ---
         qt.QApplication.processEvents()
-        t3 = time.perf_counter()
+        t2 = time.perf_counter()
 
-        self._frame_gen.append(t1 - t0)
-        self._frame_plot.append(t2 - t1)
-        self._frame_other.append(t3 - t2)
+        self._frame_plot.append(t1 - t0)
+        self._frame_other.append(t2 - t1)
         self._frame_count += 1
 
         # Update status every 0.5s
-        now = time.perf_counter()
-        if now - self._last_fps_time >= 0.5:
+        if t2 - self._last_fps_time >= 0.5:
             n = self._frame_count
-            elapsed = now - self._t_start
+            elapsed = t2 - self._t_start
             fps = n / elapsed if elapsed > 0 else 0
-            avg_gen = np.mean(self._frame_gen) * 1000
             avg_plot = np.mean(self._frame_plot) * 1000
             avg_other = np.mean(self._frame_other) * 1000
             self._status.setText(
-                f"{size}x{size} | FPS: {fps:.1f} | "
-                f"gen {avg_gen:.1f} + plot {avg_plot:.1f} + other {avg_other:.1f}ms"
+                f"{self._image_size}x{self._image_size} | FPS: {fps:.1f} | "
+                f"plot {avg_plot:.1f} + other {avg_other:.1f}ms"
             )
-            self._last_fps_time = now
+            self._last_fps_time = t2
 
         # Auto-stop after duration
-        if now - self._t_start >= self._duration:
+        if t2 - self._t_start >= self._duration:
             self._stop()
 
 
