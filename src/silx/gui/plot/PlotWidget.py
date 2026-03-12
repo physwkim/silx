@@ -2550,6 +2550,13 @@ class PlotWidget(qt.QMainWindow):
         item dirty/remove/add cycle. Otherwise falls back to the normal
         setData() path.
 
+        For maximum throughput, set explicit vmin/vmax on the colormap
+        to skip per-frame autoscale computation::
+
+            colormap = plot.getDefaultColormap()
+            colormap.setVMin(0.0)
+            colormap.setVMax(1.0)
+
         The image must already exist. Use :meth:`addImage` for first display.
 
         :param data: New image data (2D scalar or 3D RGB(A))
