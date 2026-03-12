@@ -1285,10 +1285,7 @@ class PlotFrame2DCore(PlotFrameCore):
                     else:  # axis == self.y2Axis
                         axis_name = "right"
                         corners = numpy.array(
-                            [
-                                self.pixelToData(x, y, axis="right")
-                                for (x, y) in corners
-                            ]
+                            [self.pixelToData(x, y, axis="right") for (x, y) in corners]
                         )
                         borders = (
                             (cornersInData[1], cornersInData[0]),  # left

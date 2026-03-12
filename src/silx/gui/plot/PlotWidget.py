@@ -2560,7 +2560,7 @@ class PlotWidget(qt.QMainWindow):
         item = self.getImage(legend)
         if item is None:
             return None
-        if hasattr(item, 'updateData'):
+        if hasattr(item, "updateData"):
             item.updateData(data)
         else:
             item.setData(data, copy=False)

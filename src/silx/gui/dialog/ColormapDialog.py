@@ -434,13 +434,13 @@ class _ColormapHistogram(qt.QWidget):
             plot = item.getPlot()
             if plot is not None:
                 backend = getattr(plot, "_backend", None)
-                if backend is not None and hasattr(
-                    backend, "_computeGpuHistogram"
-                ):
+                if backend is not None and hasattr(backend, "_computeGpuHistogram"):
                     # norm_mode: 0=linear (no transform), 1=log10
                     gpu_norm = 1 if norm == Colormap.LOGARITHM else 0
                     result = backend._computeGpuHistogram(
-                        data, dataRange[0], dataRange[1],
+                        data,
+                        dataRange[0],
+                        dataRange[1],
                         norm_mode=gpu_norm,
                     )
                     if result is not None:

@@ -391,7 +391,7 @@ class ImageDataBase(ImageBase, ColormapMixIn):
         data = numpy.asarray(data)
 
         renderer = self._backendRenderer
-        if renderer is None or not hasattr(renderer, 'updateData'):
+        if renderer is None or not hasattr(renderer, "updateData"):
             self.setData(data, copy=False)
             return
 

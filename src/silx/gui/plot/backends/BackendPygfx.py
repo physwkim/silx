@@ -30,7 +30,8 @@ __license__ = "MIT"
 
 import logging
 import math
-import weakref
+import re
+import threading
 
 import numpy
 import wgpu
@@ -48,16 +49,14 @@ from silx.gui.colors import RGBAColorType
 
 _logger = logging.getLogger(__name__)
 
-import re
-
-_MATHDEFAULT_RE = re.compile(r'\$\\mathdefault\{([^}]*)\}\$')
+_MATHDEFAULT_RE = re.compile(r"\$\\mathdefault\{([^}]*)\}\$")
 
 
 def _stripMathDefault(text):
     """Strip matplotlib's $\\mathdefault{...}$ LaTeX wrapping from tick labels."""
     if text is None:
         return text
-    return _MATHDEFAULT_RE.sub(r'\1', text)
+    return _MATHDEFAULT_RE.sub(r"\1", text)
 
 
 # Dash pattern mapping: silx linestyle -> pygfx dash_pattern
@@ -150,7 +149,10 @@ class _PygfxCurveItem:
             vertexColors = numpy.asarray(color, dtype=numpy.float32)
             if vertexColors.shape[1] == 3:
                 vertexColors = numpy.column_stack(
-                    [vertexColors, numpy.full(len(vertexColors), alpha, dtype=numpy.float32)]
+                    [
+                        vertexColors,
+                        numpy.full(len(vertexColors), alpha, dtype=numpy.float32),
+                    ]
                 )
             uniformColor = gfx.Color(1, 1, 1, 1)
         else:
@@ -250,7 +252,6 @@ class _PygfxCurveItem:
     def _buildErrorBarSegments(x, y, xerror, yerror):
         """Build line segments for error bars."""
         segments = []
-        capSize = 3.0  # in data units (will be small)
 
         if yerror is not None:
             yerror = numpy.asarray(yerror)
@@ -338,7 +339,6 @@ def _fastColormapRange(data, colormap):
     return colormap.getColormapRange(data)
 
 
-
 # GPU colormap helpers ########################################################
 
 
@@ -354,8 +354,7 @@ def _colormapToLUT(colormap):
 
     qNanColor = colormap.getNaNColor()
     nanColor = numpy.array(
-        [qNanColor.redF(), qNanColor.greenF(),
-         qNanColor.blueF(), qNanColor.alphaF()],
+        [qNanColor.redF(), qNanColor.greenF(), qNanColor.blueF(), qNanColor.alphaF()],
         dtype=numpy.float32,
     )
     return lut, nanColor
@@ -392,14 +391,15 @@ def _prepareScalarForGPU(data, normalization, vmin, vmax, gamma):
     elif normalization == "log":
         minPos = max(vmin, FLOAT32_MINPOS) if vmin > 0 else FLOAT32_MINPOS
         scalar = numpy.log10(numpy.clip(scalar, minPos, None))
-        clim = (float(numpy.log10(max(vmin, minPos))),
-                float(numpy.log10(max(vmax, minPos))))
+        clim = (
+            float(numpy.log10(max(vmin, minPos))),
+            float(numpy.log10(max(vmax, minPos))),
+        )
         return scalar, clim, 1.0
 
     elif normalization == "sqrt":
         scalar = numpy.sqrt(numpy.clip(scalar, 0, None))
-        clim = (float(numpy.sqrt(max(vmin, 0))),
-                float(numpy.sqrt(max(vmax, 0))))
+        clim = (float(numpy.sqrt(max(vmin, 0))), float(numpy.sqrt(max(vmax, 0))))
         return scalar, clim, 1.0
 
     elif normalization == "arcsinh":
@@ -623,33 +623,57 @@ class _WgpuComputeHelper:
 
         # Create minmax pipeline
         minmax_module = self._device.create_shader_module(code=_MINMAX_SHADER)
-        self._minmax_bgl = self._device.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
-             "buffer": {"type": "read-only-storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
-             "buffer": {"type": "storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
-             "buffer": {"type": "uniform"}},
-        ])
+        self._minmax_bgl = self._device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "read-only-storage"},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "storage"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "uniform"},
+                },
+            ]
+        )
         self._minmax_pipeline = self._device.create_compute_pipeline(
             layout=self._device.create_pipeline_layout(
-                bind_group_layouts=[self._minmax_bgl]),
+                bind_group_layouts=[self._minmax_bgl]
+            ),
             compute={"module": minmax_module, "entry_point": "main"},
         )
 
         # Create histogram pipeline
         hist_module = self._device.create_shader_module(code=_HISTOGRAM_SHADER)
-        self._hist_bgl = self._device.create_bind_group_layout(entries=[
-            {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
-             "buffer": {"type": "read-only-storage"}},
-            {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
-             "buffer": {"type": "storage"}},
-            {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
-             "buffer": {"type": "uniform"}},
-        ])
+        self._hist_bgl = self._device.create_bind_group_layout(
+            entries=[
+                {
+                    "binding": 0,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "read-only-storage"},
+                },
+                {
+                    "binding": 1,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "storage"},
+                },
+                {
+                    "binding": 2,
+                    "visibility": wgpu.ShaderStage.COMPUTE,
+                    "buffer": {"type": "uniform"},
+                },
+            ]
+        )
         self._hist_pipeline = self._device.create_compute_pipeline(
             layout=self._device.create_pipeline_layout(
-                bind_group_layouts=[self._hist_bgl]),
+                bind_group_layouts=[self._hist_bgl]
+            ),
             compute={"module": hist_module, "entry_point": "main"},
         )
 
@@ -665,7 +689,9 @@ class _WgpuComputeHelper:
             return None
 
         workgroup_size = 256
-        num_workgroups = min((num_elements + workgroup_size - 1) // workgroup_size, 65535)
+        num_workgroups = min(
+            (num_elements + workgroup_size - 1) // workgroup_size, 65535
+        )
 
         # Input buffer
         input_buf = self._device.create_buffer_with_data(
@@ -723,8 +749,10 @@ class _WgpuComputeHelper:
         final_min = float(numpy.min(result[:, 0]))
         final_max = float(numpy.max(result[:, 1]))
         min_pos_vals = result[:, 2]
-        valid_pos = min_pos_vals[min_pos_vals < 3.4e+38]
-        final_min_pos = float(numpy.min(valid_pos)) if len(valid_pos) > 0 else float("inf")
+        valid_pos = min_pos_vals[min_pos_vals < 3.4e38]
+        final_min_pos = (
+            float(numpy.min(valid_pos)) if len(valid_pos) > 0 else float("inf")
+        )
 
         # Clean up
         input_buf.destroy()
@@ -734,8 +762,7 @@ class _WgpuComputeHelper:
 
         return (final_min, final_min_pos, final_max)
 
-    def compute_histogram(self, data, data_min, data_max, num_bins=256,
-                          norm_mode=0):
+    def compute_histogram(self, data, data_min, data_max, num_bins=256, norm_mode=0):
         """Compute histogram using GPU atomic operations.
 
         :param data: numpy array (will be flattened to float32)
@@ -827,10 +854,6 @@ class _WgpuComputeHelper:
 # Async compute for streaming ##################################################
 
 
-import time as _time
-import threading
-
-
 class _AsyncCompute:
     """Non-blocking async computation for streaming image data.
 
@@ -877,8 +900,7 @@ class _AsyncCompute:
             self._pending_stats_data = data
         self._event.set()
 
-    def submit_histogram(self, data, data_min, data_max, num_bins=256,
-                         norm_mode=0):
+    def submit_histogram(self, data, data_min, data_max, num_bins=256, norm_mode=0):
         """Submit data for async histogram computation. Non-blocking.
 
         :param data: numpy array
@@ -888,8 +910,7 @@ class _AsyncCompute:
         :param norm_mode: 0=linear, 1=log10, 2=sqrt, 3=arcsinh
         """
         with self._lock:
-            self._pending_hist_request = (data, data_min, data_max, num_bins,
-                                          norm_mode)
+            self._pending_hist_request = (data, data_min, data_max, num_bins, norm_mode)
         self._event.set()
 
     def get_stats(self):
@@ -931,8 +952,7 @@ class _AsyncCompute:
             # Process histogram
             if hist_req is not None:
                 data, dmin, dmax, nbins, nmode = hist_req
-                result = self._compute_histogram(data, dmin, dmax, nbins,
-                                                 nmode)
+                result = self._compute_histogram(data, dmin, dmax, nbins, nmode)
                 if result is not None:
                     self._hist_result = result
 
@@ -955,15 +975,13 @@ class _AsyncCompute:
         except Exception:
             return None
 
-    def _compute_histogram(self, data, data_min, data_max, num_bins,
-                           norm_mode=0):
+    def _compute_histogram(self, data, data_min, data_max, num_bins, norm_mode=0):
         """Compute histogram, preferring GPU."""
         try:
             # GPU path
             if self._gpu_compute is not None:
                 result = self._gpu_compute.compute_histogram(
-                    data, data_min, data_max, num_bins,
-                    norm_mode=norm_mode
+                    data, data_min, data_max, num_bins, norm_mode=norm_mode
                 )
                 if result is not None:
                     return result
@@ -1077,9 +1095,7 @@ class _PygfxImageItem:
         else:
             rgbaData = numpy.asarray(data, dtype=numpy.uint8)
         if rgbaData.shape[2] == 3:
-            alphaChannel = numpy.full(
-                rgbaData.shape[:2] + (1,), 255, dtype=numpy.uint8
-            )
+            alphaChannel = numpy.full(rgbaData.shape[:2] + (1,), 255, dtype=numpy.uint8)
             rgbaData = numpy.concatenate([rgbaData, alphaChannel], axis=-1)
 
         rgbaFloat = rgbaData.astype(numpy.float32) / 255.0
@@ -1191,9 +1207,7 @@ class _PygfxTrianglesItem:
                 color = numpy.column_stack(
                     [color, numpy.full(len(color), alpha, dtype=numpy.float32)]
                 )
-            geom = gfx.Geometry(
-                positions=positions, indices=triangles, colors=color
-            )
+            geom = gfx.Geometry(positions=positions, indices=triangles, colors=color)
             mat = gfx.MeshBasicMaterial(color_mode="vertex", side="both")
         else:
             rgba = colors.rgba(color)
@@ -1211,8 +1225,16 @@ class _PygfxShapeItem(dict):
     """Manages pygfx scene objects for shapes."""
 
     def __init__(
-        self, x, y, shape, color, fill, overlay, linewidth,
-        linestyle, gapcolor,
+        self,
+        x,
+        y,
+        shape,
+        color,
+        fill,
+        overlay,
+        linewidth,
+        linestyle,
+        gapcolor,
     ):
         super().__init__()
 
@@ -1233,15 +1255,17 @@ class _PygfxShapeItem(dict):
         rgba = colors.rgba(color)
         dashPattern = _lineStyleToDashPattern(linestyle)
 
-        self.update({
-            "shape": shape,
-            "color": rgba,
-            "fill": fill,
-            "x": x,
-            "y": y,
-            "linewidth": linewidth,
-            "overlay": overlay,
-        })
+        self.update(
+            {
+                "shape": shape,
+                "color": rgba,
+                "fill": fill,
+                "x": x,
+                "y": y,
+                "linewidth": linewidth,
+                "overlay": overlay,
+            }
+        )
 
         self.group = gfx.Group()
 
@@ -1335,8 +1359,19 @@ class _PygfxMarkerItem(dict):
     """Manages pygfx scene objects for markers."""
 
     def __init__(
-        self, x, y, text, color, symbol, symbolsize, linewidth,
-        linestyle, constraint, yaxis, font, bgcolor,
+        self,
+        x,
+        y,
+        text,
+        color,
+        symbol,
+        symbolsize,
+        linewidth,
+        linestyle,
+        constraint,
+        yaxis,
+        font,
+        bgcolor,
     ):
         super().__init__()
 
@@ -1350,21 +1385,23 @@ class _PygfxMarkerItem(dict):
 
         dashPattern = _lineStyleToDashPattern(linestyle)
 
-        self.update({
-            "x": x,
-            "y": y,
-            "text": text,
-            "color": colors.rgba(color),
-            "constraint": constraint if isConstraint else None,
-            "symbol": symbol,
-            "symbolsize": symbolsize,
-            "linewidth": linewidth,
-            "linestyle": linestyle,
-            "dashpattern": dashPattern,
-            "yaxis": yaxis,
-            "font": font,
-            "bgcolor": bgcolor,
-        })
+        self.update(
+            {
+                "x": x,
+                "y": y,
+                "text": text,
+                "color": colors.rgba(color),
+                "constraint": constraint if isConstraint else None,
+                "symbol": symbol,
+                "symbolsize": symbolsize,
+                "linewidth": linewidth,
+                "linestyle": linestyle,
+                "dashpattern": dashPattern,
+                "yaxis": yaxis,
+                "font": font,
+                "bgcolor": bgcolor,
+            }
+        )
 
         self.group = gfx.Group()
         self._lineObj = None
@@ -1486,7 +1523,6 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         # Async compute for streaming (non-blocking stats/histogram)
         self._asyncCompute = None  # Lazy init
 
-
         self.request_draw(self._draw)
         self.setAutoFillBackground(False)
         self.setMouseTracking(True)
@@ -1519,8 +1555,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         ac.submit_stats(data)
         return ac.get_stats()
 
-    def _computeGpuHistogram(self, data, data_min, data_max, num_bins=256,
-                             norm_mode=0):
+    def _computeGpuHistogram(self, data, data_min, data_max, num_bins=256, norm_mode=0):
         """Submit data for async histogram computation and return latest result.
 
         Non-blocking: submits work to background thread and returns
@@ -1627,9 +1662,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         # Update background color only when changed
         bgColor = self._backgroundColor
         if self._cachedBgColor != bgColor:
-            self._screenBg.material = gfx.BackgroundMaterial(
-                gfx.Color(*bgColor)
-            )
+            self._screenBg.material = gfx.BackgroundMaterial(gfx.Color(*bgColor))
             self._cachedBgColor = bgColor
 
         if not self._plotFrame.isDirty:
@@ -1661,10 +1694,9 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         if len(gridVertices) >= 2:
             gridColor = gfx.Color(*self._plotFrame.gridColor)
             geom = gfx.Geometry(
-                positions=numpy.column_stack([
-                    gridVertices,
-                    numpy.zeros(len(gridVertices), dtype=numpy.float32)
-                ])
+                positions=numpy.column_stack(
+                    [gridVertices, numpy.zeros(len(gridVertices), dtype=numpy.float32)]
+                )
             )
             mat = gfx.LineSegmentMaterial(thickness=1.0, color=gridColor)
             gridLine = gfx.Line(geom, mat)
@@ -1674,10 +1706,9 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         if len(vertices) >= 2:
             fgColor = gfx.Color(*self._plotFrame.foregroundColor)
             geom = gfx.Geometry(
-                positions=numpy.column_stack([
-                    vertices,
-                    numpy.zeros(len(vertices), dtype=numpy.float32)
-                ])
+                positions=numpy.column_stack(
+                    [vertices, numpy.zeros(len(vertices), dtype=numpy.float32)]
+                )
             )
             mat = gfx.LineSegmentMaterial(thickness=1.0, color=fgColor)
             frameLine = gfx.Line(geom, mat)
@@ -1723,6 +1754,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
             if rotate:
                 import pylinalg as la
+
                 # Negate angle because screen camera flips Y
                 textObj.local.rotation = la.quat_from_axis_angle(
                     (0, 0, 1), math.radians(-rotate)
@@ -1736,12 +1768,9 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         if plot is None:
             return
 
-        trRanges = self._plotFrame.transformedDataRanges
         pixelOffset = 3
 
-        for plotItem in self.getItemsFromBackToFront(
-            condition=lambda i: i.isVisible()
-        ):
+        for plotItem in self.getItemsFromBackToFront(condition=lambda i: i.isVisible()):
             if plotItem._backendRenderer is None:
                 continue
             item = plotItem._backendRenderer
@@ -1752,7 +1781,6 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
             yCoord = item["y"]
             yAxis = item.get("yaxis", "left")
             color = item["color"]
-            bgColor = item.get("bgcolor")
             linewidth = item["linewidth"]
             dashPattern = item["dashpattern"]
 
@@ -1774,16 +1802,20 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                     # Horizontal line at y
                     pixelPos = self._plotFrame.dataToPixel(
                         0.5 * sum(self._plotFrame.dataRanges[0]),
-                        yCoord, axis=yAxis,
+                        yCoord,
+                        axis=yAxis,
                     )
                     if pixelPos is None:
                         continue
                     left = self._plotFrame.margins.left
                     right = self._plotFrame.size[0] - self._plotFrame.margins.right
-                    positions = numpy.array([
-                        [left, pixelPos[1], 0],
-                        [right, pixelPos[1], 0],
-                    ], dtype=numpy.float32)
+                    positions = numpy.array(
+                        [
+                            [left, pixelPos[1], 0],
+                            [right, pixelPos[1], 0],
+                        ],
+                        dtype=numpy.float32,
+                    )
 
                     if item["text"] is not None:
                         tx = right - pixelOffset
@@ -1802,16 +1834,21 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                     # Vertical line at x
                     yRange = self._plotFrame.dataRanges[1 if yAxis == "left" else 2]
                     pixelPos = self._plotFrame.dataToPixel(
-                        xCoord, 0.5 * sum(yRange), axis=yAxis,
+                        xCoord,
+                        0.5 * sum(yRange),
+                        axis=yAxis,
                     )
                     if pixelPos is None:
                         continue
                     top = self._plotFrame.margins.top
                     bottom = self._plotFrame.size[1] - self._plotFrame.margins.bottom
-                    positions = numpy.array([
-                        [pixelPos[0], top, 0],
-                        [pixelPos[0], bottom, 0],
-                    ], dtype=numpy.float32)
+                    positions = numpy.array(
+                        [
+                            [pixelPos[0], top, 0],
+                            [pixelPos[0], bottom, 0],
+                        ],
+                        dtype=numpy.float32,
+                    )
 
                     if item["text"] is not None:
                         tx = pixelPos[0] + pixelOffset
@@ -1840,7 +1877,9 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                 # Point marker — text label in screen space
                 if item["text"] is not None:
                     pixelPos = self._plotFrame.dataToPixel(
-                        xCoord, yCoord, axis=yAxis,
+                        xCoord,
+                        yCoord,
+                        axis=yAxis,
                     )
                     if pixelPos is None:
                         continue
@@ -1881,20 +1920,26 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         pw, ph = self._plotFrame.plotSize
 
         # Horizontal line
-        hPositions = numpy.array([
-            [left, my, 0],
-            [left + pw, my, 0],
-        ], dtype=numpy.float32)
+        hPositions = numpy.array(
+            [
+                [left, my, 0],
+                [left + pw, my, 0],
+            ],
+            dtype=numpy.float32,
+        )
         hGeom = gfx.Geometry(positions=hPositions)
         hMat = gfx.LineMaterial(thickness=linewidth, color=gfxColor)
         self._crosshairHLine = gfx.Line(hGeom, hMat)
         self._screenScene.add(self._crosshairHLine)
 
         # Vertical line
-        vPositions = numpy.array([
-            [mx, top, 0],
-            [mx, top + ph, 0],
-        ], dtype=numpy.float32)
+        vPositions = numpy.array(
+            [
+                [mx, top, 0],
+                [mx, top + ph, 0],
+            ],
+            dtype=numpy.float32,
+        )
         vGeom = gfx.Geometry(positions=vPositions)
         vMat = gfx.LineMaterial(thickness=linewidth, color=gfxColor)
         self._crosshairVLine = gfx.Line(vGeom, vMat)
@@ -2018,8 +2063,21 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
     # Backend API: Add methods ##############################################
 
     def addCurve(
-        self, x, y, color, gapcolor, symbol, linewidth, linestyle,
-        yaxis, xerror, yerror, fill, alpha, symbolsize, baseline,
+        self,
+        x,
+        y,
+        color,
+        gapcolor,
+        symbol,
+        linewidth,
+        linestyle,
+        yaxis,
+        xerror,
+        yerror,
+        fill,
+        alpha,
+        symbolsize,
+        baseline,
     ):
         x = numpy.asarray(x, dtype=numpy.float64)
         y = numpy.asarray(y, dtype=numpy.float64)
@@ -2066,8 +2124,20 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                     baseline = numpy.nan
 
         item = _PygfxCurveItem(
-            x, y, color, gapcolor, symbol, linewidth, linestyle,
-            yaxis, xerror, yerror, fill, alpha, symbolsize, baseline,
+            x,
+            y,
+            color,
+            gapcolor,
+            symbol,
+            linewidth,
+            linestyle,
+            yaxis,
+            xerror,
+            yerror,
+            fill,
+            alpha,
+            symbolsize,
+            baseline,
         )
         self._dataGroup.add(item.group)
         return item
@@ -2098,11 +2168,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
         # Reuse pooled item if shape matches (avoids GPU object recreation)
         reuse = self._reusableImageItem
-        if (
-            reuse is not None
-            and data.ndim == 2
-            and reuse._scalarShape == data.shape
-        ):
+        if reuse is not None and data.ndim == 2 and reuse._scalarShape == data.shape:
             self._reusableImageItem = None
             reuse._build(data, (ox, oy), (sx, sy), colormap, alpha)
             self._dataGroup.add(reuse.group)
@@ -2121,7 +2187,16 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         return item
 
     def addShape(
-        self, x, y, shape, color, fill, overlay, linestyle, linewidth, gapcolor,
+        self,
+        x,
+        y,
+        shape,
+        color,
+        fill,
+        overlay,
+        linestyle,
+        linewidth,
+        gapcolor,
     ):
         x = self._logTransformX(numpy.asarray(x, dtype=numpy.float64))
         y = self._logTransformY(numpy.asarray(y, dtype=numpy.float64))
@@ -2129,7 +2204,15 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         if overlay and linewidth < 2.0:
             linewidth = 2.0
         item = _PygfxShapeItem(
-            x, y, shape, color, fill, overlay, linewidth, linestyle, gapcolor,
+            x,
+            y,
+            shape,
+            color,
+            fill,
+            overlay,
+            linewidth,
+            linestyle,
+            gapcolor,
         )
         if overlay:
             self._overlayGroup.add(item.group)
@@ -2165,8 +2248,18 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
                 y = math.log10(y) if y > 0 else numpy.nan
 
         item = _PygfxMarkerItem(
-            x, y, text, color, symbol, symbolsize, linewidth,
-            linestyle, constraint, yaxis, font, bgcolor,
+            x,
+            y,
+            text,
+            color,
+            symbol,
+            symbolsize,
+            linewidth,
+            linestyle,
+            constraint,
+            yaxis,
+            font,
+            bgcolor,
         )
 
         self._overlayGroup.add(item.group)
@@ -2327,8 +2420,10 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
 
         # Find points within the pick area
         indices = numpy.where(
-            (xData >= xPickMin) & (xData <= xPickMax)
-            & (yData >= yPickMin) & (yData <= yPickMax)
+            (xData >= xPickMin)
+            & (xData <= xPickMax)
+            & (yData >= yPickMin)
+            & (yData <= yPickMax)
         )[0]
 
         if len(indices) > 0:
@@ -2436,9 +2531,7 @@ class BackendPygfx(BackendBase.BackendBase, QRenderWidget):
         else:
             raise RuntimeError("Unsupported dimension to keep: %s" % keepDim)
 
-        self._setDataRanges(
-            xlim=(xMin, xMax), ylim=(yMin, yMax), y2lim=(y2Min, y2Max)
-        )
+        self._setDataRanges(xlim=(xMin, xMax), ylim=(yMin, yMax), y2lim=(y2Min, y2Max))
 
     def _setPlotBounds(self, xRange=None, yRange=None, y2Range=None, keepDim=None):
         self._setDataRanges(xlim=xRange, ylim=yRange, y2lim=y2Range)
