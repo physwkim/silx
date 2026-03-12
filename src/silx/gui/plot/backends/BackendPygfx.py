@@ -30,9 +30,11 @@ __license__ = "MIT"
 
 import logging
 import math
+import threading
 import weakref
 
 import numpy
+import wgpu
 
 from rendercanvas.qt import QRenderWidget
 import pygfx as gfx
@@ -337,6 +339,344 @@ def _fastColormapRange(data, colormap):
     return colormap.getColormapRange(data)
 
 
+# GPU compute helpers ##########################################################
+
+_MINMAX_SHADER = """
+struct Params {
+    num_elements: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input_data: array<f32>;
+@group(0) @binding(1) var<storage, read_write> output_data: array<f32>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+var<workgroup> s_min: array<f32, 256>;
+var<workgroup> s_max: array<f32, 256>;
+var<workgroup> s_min_pos: array<f32, 256>;
+
+@compute @workgroup_size(256)
+fn main(@builtin(local_invocation_id) lid: vec3<u32>,
+        @builtin(workgroup_id) wgid: vec3<u32>) {
+    let tid = lid.x;
+    let gid = wgid.x * 256u + tid;
+    let stride = 256u * ((params.num_elements + 255u) / 256u);
+
+    var local_min: f32 = 3.402823e+38;
+    var local_max: f32 = -3.402823e+38;
+    var local_min_pos: f32 = 3.402823e+38;
+
+    var idx = gid;
+    while (idx < params.num_elements) {
+        let val = input_data[idx];
+        if (!isNan(val) && !isInf(val)) {
+            local_min = min(local_min, val);
+            local_max = max(local_max, val);
+            if (val > 0.0) {
+                local_min_pos = min(local_min_pos, val);
+            }
+        }
+        idx += stride;
+    }
+
+    s_min[tid] = local_min;
+    s_max[tid] = local_max;
+    s_min_pos[tid] = local_min_pos;
+    workgroupBarrier();
+
+    var step = 128u;
+    while (step > 0u) {
+        if (tid < step) {
+            s_min[tid] = min(s_min[tid], s_min[tid + step]);
+            s_max[tid] = max(s_max[tid], s_max[tid + step]);
+            s_min_pos[tid] = min(s_min_pos[tid], s_min_pos[tid + step]);
+        }
+        workgroupBarrier();
+        step = step >> 1u;
+    }
+
+    if (tid == 0u) {
+        let out_idx = wgid.x * 3u;
+        output_data[out_idx] = s_min[0];
+        output_data[out_idx + 1u] = s_max[0];
+        output_data[out_idx + 2u] = s_min_pos[0];
+    }
+}
+
+fn isNan(v: f32) -> bool { return !(v == v); }
+fn isInf(v: f32) -> bool { return abs(v) > 3.4e+38; }
+"""
+
+_HISTOGRAM_SHADER = """
+struct Params {
+    num_elements: u32,
+    data_min: f32,
+    data_max: f32,
+    num_bins: u32,
+    norm_mode: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
+}
+
+@group(0) @binding(0) var<storage, read> input_data: array<f32>;
+@group(0) @binding(1) var<storage, read_write> histogram: array<atomic<u32>>;
+@group(0) @binding(2) var<uniform> params: Params;
+
+fn apply_norm(val: f32, mode: u32) -> f32 {
+    switch (mode) {
+        case 1u: {
+            if (val <= 0.0) { return -1e30; }
+            return log2(val) * 0.30102999566;
+        }
+        case 2u: { return sqrt(max(val, 0.0)); }
+        case 3u: { return asinh(val); }
+        default: { return val; }
+    }
+}
+
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let range = params.data_max - params.data_min;
+    if (range <= 0.0) { return; }
+
+    let total_threads = 256u * ((params.num_elements + 255u) / 256u);
+    var idx = gid.x;
+    while (idx < params.num_elements) {
+        let val = input_data[idx];
+        if (val == val) {
+            let transformed = apply_norm(val, params.norm_mode);
+            var normalized = (transformed - params.data_min) / range;
+            normalized = clamp(normalized, 0.0, 0.999999);
+            let bin = u32(normalized * f32(params.num_bins));
+            atomicAdd(&histogram[bin], 1u);
+        }
+        idx += total_threads;
+    }
+}
+"""
+
+_HIST_NORM_LINEAR = 0
+_HIST_NORM_LOG = 1
+_HIST_NORM_SQRT = 2
+_HIST_NORM_ARCSINH = 3
+
+
+class _WgpuComputeHelper:
+    """GPU compute helper for min/max reduction and histogram computation."""
+
+    _instance = None
+
+    @classmethod
+    def get(cls):
+        """Get or create the singleton compute helper."""
+        if cls._instance is None:
+            try:
+                cls._instance = cls()
+            except Exception:
+                _logger.debug("Failed to create GPU compute helper", exc_info=True)
+                cls._instance = False
+        if cls._instance is False:
+            return None
+        return cls._instance
+
+    def __init__(self):
+        adapter = wgpu.gpu.request_adapter_sync(power_preference="high-performance")
+        self._device = adapter.request_device_sync()
+
+        minmax_module = self._device.create_shader_module(code=_MINMAX_SHADER)
+        self._minmax_bgl = self._device.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+                 "buffer": {"type": "read-only-storage"}},
+                {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
+                 "buffer": {"type": "storage"}},
+                {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
+                 "buffer": {"type": "uniform"}},
+            ]
+        )
+        self._minmax_pipeline = self._device.create_compute_pipeline(
+            layout=self._device.create_pipeline_layout(
+                bind_group_layouts=[self._minmax_bgl]),
+            compute={"module": minmax_module, "entry_point": "main"},
+        )
+
+        hist_module = self._device.create_shader_module(code=_HISTOGRAM_SHADER)
+        self._hist_bgl = self._device.create_bind_group_layout(
+            entries=[
+                {"binding": 0, "visibility": wgpu.ShaderStage.COMPUTE,
+                 "buffer": {"type": "read-only-storage"}},
+                {"binding": 1, "visibility": wgpu.ShaderStage.COMPUTE,
+                 "buffer": {"type": "storage"}},
+                {"binding": 2, "visibility": wgpu.ShaderStage.COMPUTE,
+                 "buffer": {"type": "uniform"}},
+            ]
+        )
+        self._hist_pipeline = self._device.create_compute_pipeline(
+            layout=self._device.create_pipeline_layout(
+                bind_group_layouts=[self._hist_bgl]),
+            compute={"module": hist_module, "entry_point": "main"},
+        )
+
+        # Buffer cache for minmax (reused across calls with same size)
+        self._mm_cached_size = 0
+        self._mm_input_buf = None
+        self._mm_output_buf = None
+        self._mm_readback_buf = None
+        self._mm_params_buf = None
+        self._mm_bind_group = None
+        self._mm_num_workgroups = 0
+
+    def _ensure_minmax_buffers(self, num_elements):
+        """Create or reuse GPU buffers for minmax computation."""
+        if num_elements == self._mm_cached_size:
+            return  # Reuse existing buffers
+
+        # Clean up old buffers
+        if self._mm_input_buf is not None:
+            self._mm_input_buf.destroy()
+            self._mm_output_buf.destroy()
+            self._mm_readback_buf.destroy()
+            self._mm_params_buf.destroy()
+
+        workgroup_size = 256
+        num_workgroups = min(
+            (num_elements + workgroup_size - 1) // workgroup_size, 65535)
+        output_size = num_workgroups * 3 * 4
+
+        self._mm_input_buf = self._device.create_buffer(
+            size=num_elements * 4,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_DST)
+        self._mm_output_buf = self._device.create_buffer(
+            size=output_size,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+        self._mm_readback_buf = self._device.create_buffer(
+            size=output_size,
+            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ)
+
+        params = numpy.array([num_elements], dtype=numpy.uint32)
+        self._mm_params_buf = self._device.create_buffer_with_data(
+            data=params.tobytes(), usage=wgpu.BufferUsage.UNIFORM)
+
+        self._mm_bind_group = self._device.create_bind_group(
+            layout=self._minmax_bgl,
+            entries=[
+                {"binding": 0, "resource": {"buffer": self._mm_input_buf}},
+                {"binding": 1, "resource": {"buffer": self._mm_output_buf}},
+                {"binding": 2, "resource": {"buffer": self._mm_params_buf}},
+            ])
+
+        self._mm_num_workgroups = num_workgroups
+        self._mm_cached_size = num_elements
+
+    def compute_minmax(self, data):
+        """Compute (min, minPositive, max) using GPU reduction.
+
+        Reuses GPU buffers for repeated calls with same-sized data.
+        """
+        flat = numpy.ascontiguousarray(data.ravel(), dtype=numpy.float32)
+        num_elements = len(flat)
+        if num_elements == 0:
+            return None
+
+        self._ensure_minmax_buffers(num_elements)
+
+        # Upload data (reuse existing buffer)
+        self._device.queue.write_buffer(self._mm_input_buf, 0, flat.tobytes())
+
+        encoder = self._device.create_command_encoder()
+        cp = encoder.begin_compute_pass()
+        cp.set_pipeline(self._minmax_pipeline)
+        cp.set_bind_group(0, self._mm_bind_group)
+        cp.dispatch_workgroups(self._mm_num_workgroups)
+        cp.end()
+
+        output_size = self._mm_num_workgroups * 3 * 4
+        encoder.copy_buffer_to_buffer(
+            self._mm_output_buf, 0, self._mm_readback_buf, 0, output_size)
+        self._device.queue.submit([encoder.finish()])
+
+        self._mm_readback_buf.map_sync(wgpu.MapMode.READ)
+        result = numpy.frombuffer(
+            self._mm_readback_buf.read_mapped(), dtype=numpy.float32).copy()
+        self._mm_readback_buf.unmap()
+
+        result = result.reshape(-1, 3)
+        final_min = float(numpy.min(result[:, 0]))
+        final_max = float(numpy.max(result[:, 1]))
+        min_pos_vals = result[:, 2]
+        valid_pos = min_pos_vals[min_pos_vals < 3.4e38]
+        final_min_pos = (
+            float(numpy.min(valid_pos)) if len(valid_pos) > 0 else float("inf"))
+
+        return (final_min, final_min_pos, final_max)
+
+    def compute_histogram(self, data, data_min, data_max, num_bins=256, norm_mode=0):
+        """Compute histogram using GPU atomic operations."""
+        flat = numpy.ascontiguousarray(data.ravel(), dtype=numpy.float32)
+        num_elements = len(flat)
+        if num_elements == 0:
+            return None
+
+        workgroup_size = 256
+        num_workgroups = min(
+            (num_elements + workgroup_size - 1) // workgroup_size, 65535)
+
+        input_buf = self._device.create_buffer_with_data(
+            data=flat.tobytes(), usage=wgpu.BufferUsage.STORAGE)
+        hist_size = num_bins * 4
+        hist_buf = self._device.create_buffer(
+            size=hist_size,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+
+        params = numpy.zeros(8, dtype=numpy.float32)
+        params_view = params.view(numpy.uint32)
+        params_view[0] = num_elements
+        params[1] = numpy.float32(data_min)
+        params[2] = numpy.float32(data_max)
+        params_view[3] = num_bins
+        params_view[4] = norm_mode
+        params_buf = self._device.create_buffer_with_data(
+            data=params.tobytes(), usage=wgpu.BufferUsage.UNIFORM)
+
+        bind_group = self._device.create_bind_group(
+            layout=self._hist_bgl,
+            entries=[
+                {"binding": 0, "resource": {"buffer": input_buf}},
+                {"binding": 1, "resource": {"buffer": hist_buf}},
+                {"binding": 2, "resource": {"buffer": params_buf}},
+            ])
+
+        encoder = self._device.create_command_encoder()
+        cp = encoder.begin_compute_pass()
+        cp.set_pipeline(self._hist_pipeline)
+        cp.set_bind_group(0, bind_group)
+        cp.dispatch_workgroups(num_workgroups)
+        cp.end()
+
+        readback_buf = self._device.create_buffer(
+            size=hist_size,
+            usage=wgpu.BufferUsage.COPY_DST | wgpu.BufferUsage.MAP_READ)
+        encoder.copy_buffer_to_buffer(hist_buf, 0, readback_buf, 0, hist_size)
+        self._device.queue.submit([encoder.finish()])
+
+        readback_buf.map_sync(wgpu.MapMode.READ)
+        counts = numpy.frombuffer(
+            readback_buf.read_mapped(), dtype=numpy.uint32).copy()
+        readback_buf.unmap()
+
+        bin_edges = numpy.linspace(data_min, data_max, num_bins + 1)
+
+        input_buf.destroy()
+        hist_buf.destroy()
+        params_buf.destroy()
+        readback_buf.destroy()
+
+        return (counts, bin_edges)
+
+
+# Image item ##################################################################
+
+
 class _PygfxImageItem:
     """Manages pygfx scene objects for a single image."""
 
@@ -409,7 +749,8 @@ class _PygfxImageItem:
         Requires the image object to already exist and data shape to match.
 
         :param data: New image data (2D array)
-        :param clim: (vmin, vmax) tuple for color limits, or None to keep current
+        :param clim: (vmin, vmax) tuple for color limits, or None to
+            compute via GPU (preferred) or CPU fallback.
         """
         if self._imageObj is None:
             return
@@ -418,6 +759,15 @@ class _PygfxImageItem:
         else:
             scalarData = numpy.ascontiguousarray(data, dtype=numpy.float32)
         self._imageObj.geometry.grid.set_data(scalarData)
+
+        if clim is None:
+            # CPU minmax (faster than GPU for this operation due to transfer cost)
+            dmin = float(numpy.nanmin(data))
+            dmax = float(numpy.nanmax(data))
+            if dmin >= dmax:
+                dmax = dmin + 1.0
+            clim = (dmin, dmax)
+
         if clim is not None:
             self._imageObj.material.clim = clim
 

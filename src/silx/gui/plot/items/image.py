@@ -371,6 +371,32 @@ class ImageDataBase(ImageBase, ColormapMixIn):
         elif numpy.iscomplexobj(data):
             _logger.warning("Converting complex image to absolute value to plot it.")
             data = numpy.absolute(data)
+
+        # Fast path: same shape, backend renderer supports direct update
+        renderer = self._backendRenderer
+        if (
+            renderer is not None
+            and hasattr(renderer, 'updateData')
+            and self._data.shape == data.shape
+        ):
+            self._data = data
+            self._valueDataChanged()
+
+            # Compute clim: fixed range or delegate to renderer (GPU/CPU)
+            colormap = self.getColormap()
+            vmin, vmax = colormap.getVMin(), colormap.getVMax()
+            if vmin is not None and vmax is not None:
+                renderer.updateData(data, clim=(float(vmin), float(vmax)))
+            else:
+                # Autoscale: let renderer compute via GPU if available
+                renderer.updateData(data, clim=None)
+
+            plot = self.getPlot()
+            if plot is not None:
+                plot._setDirtyPlot()
+            self.sigItemChanged.emit(ItemChangedType.DATA)
+            return
+
         super().setData(data)
 
     def _updated(self, event=None, checkVisibility=True):
@@ -378,43 +404,6 @@ class ImageDataBase(ImageBase, ColormapMixIn):
         if event in (ItemChangedType.DATA, ItemChangedType.MASK):
             self._setColormappedData(self.getValueData(copy=False), copy=False)
         super()._updated(event=event, checkVisibility=checkVisibility)
-
-    def updateData(self, data):
-        """Update image data for streaming without full pipeline rebuild.
-
-        Optimized for repeated updates of same-shape data.
-        Bypasses the item dirty/remove/add cycle by updating the backend
-        renderer directly when supported.
-
-        Falls back to setData() if no fast path is available.
-        """
-        data = numpy.asarray(data)
-
-        renderer = self._backendRenderer
-        if renderer is None or not hasattr(renderer, 'updateData'):
-            self.setData(data, copy=False)
-            return
-
-        # Compute clim from colormap settings
-        colormap = self.getColormap()
-        vmin, vmax = colormap.getVMin(), colormap.getVMax()
-        if vmin is None or vmax is None:
-            dmin = float(numpy.nanmin(data))
-            dmax = float(numpy.nanmax(data))
-            if dmin >= dmax:
-                dmax = dmin + 1.0
-            vmin = float(vmin) if vmin is not None else dmin
-            vmax = float(vmax) if vmax is not None else dmax
-        else:
-            vmin, vmax = float(vmin), float(vmax)
-
-        # Direct backend update (no item system overhead)
-        renderer.updateData(data, clim=(vmin, vmax))
-
-        # Schedule redraw
-        plot = self.getPlot()
-        if plot is not None:
-            plot._setDirtyPlot()
 
 
 class ImageData(ImageDataBase):
@@ -544,7 +533,7 @@ class ImageData(ImageDataBase):
                 alpha = numpy.clip(alpha, 0.0, 1.0)
         self.__alpha = alpha
 
-        super().setData(data)
+        super().setData(data, copy=False)
 
 
 class ImageRgba(ImageBase):
