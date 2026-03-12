@@ -386,6 +386,9 @@ class ImageDataBase(ImageBase, ColormapMixIn):
         Bypasses the item dirty/remove/add cycle by updating the backend
         renderer directly when supported.
 
+        When autoscale is active (vmin or vmax is None), the colormap
+        range is recomputed from the new data.
+
         Falls back to setData() if no fast path is available.
         """
         data = numpy.asarray(data)
@@ -396,6 +399,11 @@ class ImageDataBase(ImageBase, ColormapMixIn):
             return
 
         renderer.updateData(data)
+
+        # When autoscale is active, recompute colormap range
+        colormap = self.getColormap()
+        if colormap.getVMin() is None or colormap.getVMax() is None:
+            self._setColormappedData(data, copy=False)
 
         # Schedule redraw
         plot = self.getPlot()
