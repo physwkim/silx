@@ -582,6 +582,8 @@ class Scatter(PointsBase, ColormapMixIn, ScatterVisualizationMixIn):
 
         elif visualization is self.Visualization.POINTS:
             rgbacolors = self.__applyColormapToData()
+            if len(rgbacolors) != len(mask):
+                return None
             return backend.addCurve(
                 xFiltered,
                 yFiltered,
@@ -619,6 +621,8 @@ class Scatter(PointsBase, ColormapMixIn, ScatterVisualizationMixIn):
                     return None
                 else:
                     rgbacolors = self.__applyColormapToData()
+                    if len(rgbacolors) != len(mask):
+                        return None
                     triangles = triangulation.triangles.astype(numpy.int32)
                     return backend.addTriangles(
                         xFiltered,
@@ -689,6 +693,8 @@ class Scatter(PointsBase, ColormapMixIn, ScatterVisualizationMixIn):
                     return None
 
                 rgbacolors = self.__applyColormapToData()
+                if len(rgbacolors) != len(mask):
+                    return None
 
                 nbpoints = len(xFiltered)
                 if nbpoints == 1:
