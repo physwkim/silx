@@ -35,6 +35,8 @@ __license__ = "MIT"
 __date__ = "02/05/2018"
 
 
+import math
+
 import matplotlib
 import numpy
 
@@ -50,10 +52,9 @@ else:
 
 
 from matplotlib.font_manager import FontProperties
-from matplotlib.mathtext import MathTextParser
 from matplotlib.ticker import ScalarFormatter as _ScalarFormatter
-from matplotlib import figure, font_manager
-from matplotlib.backends.backend_agg import FigureCanvasAgg
+from matplotlib import cbook, font_manager
+from matplotlib.backends.backend_agg import RendererAgg
 
 
 class DefaultTickFormatter(_ScalarFormatter):
@@ -107,67 +108,63 @@ def rasterMathText(
     :param dotsPerInch: The DPI resolution of the created image
     :return: Corresponding image in gray scale and baseline offset from top
     """
-    # Implementation adapted from:
-    # https://github.com/matplotlib/matplotlib/blob/d624571a19aec7c7d4a24123643288fc27db17e7/lib/matplotlib/mathtext.py#L264
-
-    stripped_text = text.strip("\n")
     font_prop = qFontToFontProperties(font)
+    # Measure with the renderer that draws, so that the image fits the drawn text
+    renderer = RendererAgg(1, 1, dotsPerInch)
 
-    parser = MathTextParser("path")
-    lines_info = [
-        parser.parse(line, prop=font_prop, dpi=dotsPerInch)
-        for line in stripped_text.split("\n")
-    ]
-    max_line_width = max(info[0] for info in lines_info)
-    # Use lp string as minimum height/ascent
-    ref_info = parser.parse("lp", prop=font_prop, dpi=dotsPerInch)
-    line_height = max(
-        ref_info[1],
-        *(info[1] for info in lines_info),
-    )
-    first_line_ascent = max(
-        ref_info[1] - ref_info[2], lines_info[0][1] - lines_info[0][2]
-    )
-
-    linespacing = 1.2
-
-    figure_height = numpy.ceil(line_height * len(lines_info) * linespacing) + 2
-    fig = figure.Figure(
-        figsize=(
-            (max_line_width + 1) / dotsPerInch,
-            figure_height / dotsPerInch,
+    def measure(line: str, ismath: bool) -> tuple[float, float, float]:
+        """Returns the width, ascent and descent of a line"""
+        if not line:
+            return 0.0, 0.0, 0.0
+        width, height, descent = renderer.get_text_width_height_descent(
+            line, font_prop, ismath
         )
-    )
-    fig.set_dpi(dotsPerInch)
-    text = fig.text(
-        0,
-        1,
-        stripped_text,
-        fontproperties=font_prop,
-        verticalalignment="top",
-    )
-    text.set_linespacing(linespacing)
+        return width, height - descent, descent
 
-    canvas = FigureCanvasAgg(fig)
-    buffer, (canvas_width, canvas_height) = canvas.print_to_buffer()
-    image = numpy.frombuffer(buffer, dtype=numpy.uint8).reshape(
-        canvas_height, canvas_width, 4
+    lines = []
+    for line in text.strip("\n").split("\n"):
+        ismath = cbook.is_math_text(line)
+        lines.append((line if ismath else line.replace(r"\$", "$"), ismath))
+    metrics = [measure(line, ismath) for line, ismath in lines]
+
+    # Use lp string as minimum ascent/descent
+    _, ref_ascent, ref_descent = measure("lp", False)
+    ascents = [max(ascent, ref_ascent) for _, ascent, _ in metrics]
+    descents = [max(descent, ref_descent) for _, _, descent in metrics]
+    line_height = 1.2 * (ref_ascent + ref_descent)
+
+    # Pixel aligned baselines, with a margin larger than any glyph overhang
+    margin = math.ceil(ref_ascent + ref_descent)
+    baselines = [margin + math.ceil(ascents[0])]
+    for descent, ascent in zip(descents[:-1], ascents[1:]):
+        baselines.append(baselines[-1] + math.ceil(max(line_height, descent + ascent)))
+
+    renderer = RendererAgg(
+        math.ceil(max(width for width, _, _ in metrics)) + 2 * margin,
+        baselines[-1] + math.ceil(descents[-1]) + margin,
+        dotsPerInch,
     )
+    gc = renderer.new_gc()
+    for (line, ismath), baseline in zip(lines, baselines):
+        if line:
+            renderer.draw_text(gc, margin, baseline, line, font_prop, 0, ismath)
+    gc.restore()
+    # Black text on a transparent background: alpha is the coverage
+    array = numpy.asarray(renderer.buffer_rgba())[:, :, 3]
 
-    # RGB to inverted R channel
-    array = 255 - image[:, :, 0]
+    filled_rows = numpy.nonzero(numpy.any(array, axis=1))[0]
+    filled_columns = numpy.nonzero(numpy.any(array, axis=0))[0]
+    if len(filled_rows) == 0:
+        return numpy.ascontiguousarray(array), float(baselines[0])
 
-    # Remove leading/trailing empty columns and trailing rows but one on each side
-    filled_rows = numpy.nonzero(numpy.sum(array, axis=1))[0]
-    filled_columns = numpy.nonzero(numpy.sum(array, axis=0))[0]
-    if len(filled_rows) == 0 or len(filled_columns) == 0:
-        return array, first_line_ascent
+    # Crop to the text with an empty border, keeping the first line ascent at the top
+    top = min(baselines[0] - math.ceil(ascents[0]), filled_rows[0] - 1)
     return (
         numpy.ascontiguousarray(
             array[
-                0 : filled_rows[-1] + 2,
-                max(0, filled_columns[0] - 1) : filled_columns[-1] + 2,
+                top : filled_rows[-1] + 2,
+                filled_columns[0] - 1 : filled_columns[-1] + 2,
             ]
         ),
-        first_line_ascent,
+        float(baselines[0] - top),
     )
