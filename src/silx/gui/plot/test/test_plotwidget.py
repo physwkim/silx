@@ -2205,6 +2205,21 @@ def test_mpl_curve_symbol(qapp, plotWidget: PlotWidget, symbol: str) -> None:
     assert len(plotWidget._backend.ax.lines) == 1
 
 
+@pytest.mark.parametrize("plotWidget", ("mpl", "gl", "pygfx"), indirect=True)
+@pytest.mark.parametrize("yaxis", ("left", "right"))
+def test_inverted_y_axes(qapp, plotWidget: PlotWidget, yaxis: str) -> None:
+    """Both Y axes follow the orientation of the left one"""
+    plotWidget.addCurve(x=(0, 1), y=(0, 1), legend="left")
+    plotWidget.addCurve(x=(0, 1), y=(0, 100), legend="right", yaxis="right")
+    plotWidget.getYAxis().setInverted(True)
+    qapp.processEvents()
+
+    ymin, ymax = plotWidget.getYAxis(yaxis).getLimits()
+    yminPixel = plotWidget.dataToPixel(0, ymin, axis=yaxis)[1]
+    ymaxPixel = plotWidget.dataToPixel(0, ymax, axis=yaxis)[1]
+    assert ymaxPixel > yminPixel
+
+
 def test_data_range_ignores_added_hidden_item(qapp: qt.QApplication) -> None:
     """Adding a hidden item does not change the data range."""
     plot = PlotWidget(backend="none")

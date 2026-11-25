@@ -1344,6 +1344,7 @@ class BackendMatplotlib(BackendBase.BackendBase):
     def setYAxisInverted(self, flag: bool):
         if self.ax.yaxis_inverted() != bool(flag):
             self.ax.invert_yaxis()
+            self.ax2.invert_yaxis()
             self._updateMarkers()
 
     def isYAxisInverted(self) -> bool:
