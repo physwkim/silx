@@ -2197,6 +2197,14 @@ def test_mpl_replot_with_widget_deleted_during_draw(qapp: qt.QApplication) -> No
     assert not isValid(plotWidget)
 
 
+@pytest.mark.parametrize("symbol", Curve.getSupportedSymbols())
+def test_mpl_curve_symbol(qapp, plotWidget: PlotWidget, symbol: str) -> None:
+    plotWidget.addCurve(x=(0, 1, 2), y=(0, 1, 2), symbol=symbol)
+    qapp.processEvents()
+
+    assert len(plotWidget._backend.ax.lines) == 1
+
+
 def test_data_range_ignores_added_hidden_item(qapp: qt.QApplication) -> None:
     """Adding a hidden item does not change the data range."""
     plot = PlotWidget(backend="none")

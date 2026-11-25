@@ -676,6 +676,7 @@ class BackendMatplotlib(BackendBase.BackendBase):
             axes = self.ax
 
         pickradius = 3
+        marker = self._getMarkerFromSymbol(symbol)
 
         artists = []  # All the artists composing the curve
 
@@ -727,7 +728,6 @@ class BackendMatplotlib(BackendBase.BackendBase):
                 )
                 artists += list(curveList)
 
-            marker = self._getMarkerFromSymbol(symbol)
             scatter = axes.scatter(
                 x,
                 y,
@@ -757,7 +757,7 @@ class BackendMatplotlib(BackendBase.BackendBase):
                 linestyle=linestyle,
                 color=color,
                 linewidth=linewidth,
-                marker=symbol,
+                marker=marker,
                 picker=True,
                 pickradius=pickradius,
                 markersize=symbolsize,
